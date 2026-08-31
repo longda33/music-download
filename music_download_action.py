@@ -226,24 +226,29 @@ def webdav_auth():
     return (os.environ["WEBDAV_USERNAME"], os.environ["WEBDAV_PASSWORD"])
 
 
-def webdav_path(filename=None):
+def webdav_path(filename=None, subfolder=None):
     base = os.environ["WEBDAV_URL"].rstrip("/")
     folder = os.getenv("WEBDAV_FOLDER", "Music").strip("/")
-    path = "/".join(quote(part, safe="") for part in ([folder] if not filename else [*folder.split("/"), filename]))
+    parts = folder.split("/") if folder else []
+    if subfolder:
+        parts.append(str(subfolder).strip("/"))
+    if filename:
+        parts.append(filename)
+    path = "/".join(quote(part, safe="") for part in parts)
     return f"{base}/{path}"
 
 
-def ensure_webdav_folder(auth):
+def ensure_webdav_folder(auth, subfolder=None):
     # 目录应提前创建；已存在时 WebDAV 返回 405，忽略即可。
-    url = webdav_path()
+    url = webdav_path(subfolder=subfolder)
     r = requests.request("MKCOL", url, auth=auth, timeout=60)
     if r.status_code not in (201, 405, 409):
         r.raise_for_status()
 
 
-def webdav_listing(auth):
+def webdav_listing(auth, subfolder=None):
     xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?><d:propfind xmlns:d=\"DAV:\"><d:prop><d:displayname/><d:getcontentlength/></d:prop></d:propfind>"
-    r = requests.request("PROPFIND", webdav_path(), auth=auth, headers={"Depth": "1", "Content-Type": "application/xml"}, data=xml.encode(), timeout=60)
+    r = requests.request("PROPFIND", webdav_path(subfolder=subfolder), auth=auth, headers={"Depth": "1", "Content-Type": "application/xml"}, data=xml.encode(), timeout=60)
     r.raise_for_status()
     root = __import__("xml.etree.ElementTree", fromlist=["ElementTree"]).fromstring(r.content)
     ns = {"d": "DAV:"}
@@ -256,9 +261,9 @@ def webdav_listing(auth):
     return result
 
 
-def choose_filename(auth, base_filename, size):
+def choose_filename(auth, base_filename, size, subfolder=None):
     """同名且相近则跳过；同名不同体积则追加 [xx.xxMB]。"""
-    files = webdav_listing(auth)
+    files = webdav_listing(auth, subfolder=subfolder)
     if base_filename in files and abs(files[base_filename] - size) <= SIZE_TOLERANCE:
         return None
     if base_filename not in files:
@@ -273,8 +278,8 @@ def choose_filename(auth, base_filename, size):
     return f"{stem} [{size / (1024 * 1024):.2f}MB] ({n}){ext}"
 
 
-def upload(auth, local_path, filename):
-    url = webdav_path(filename)
+def upload(auth, local_path, filename, subfolder=None):
+    url = webdav_path(filename, subfolder=subfolder)
     log(f"WebDAV PUT：{filename}")
     with local_path.open("rb") as handle:
         r = requests.put(url, auth=auth, data=handle, headers={"Content-Length": str(local_path.stat().st_size), "Content-Type": "audio/flac"}, timeout=600)
@@ -309,7 +314,7 @@ def main():
     log(f"目录检索完成：共 {len(songs)} 首，三人及以上合唱已过滤")
     auth = webdav_auth()
     ensure_webdav_folder(auth)
-    log("WebDAV 连接正常，开始逐首处理")
+    log("WebDAV 连接正常，开始逐首处理；文件将保存到歌手名文件夹")
     work = Path("downloaded_music")
     work.mkdir(exist_ok=True)
     success = 0
@@ -324,6 +329,9 @@ def main():
             failed.append(label)
             continue
         log(f"[{index}/{len(songs)}] 找到音源：{found['source']} {found.get('quality', 'FLAC')}")
+        artist_folder = safe_name(found["artist"])
+        ensure_webdav_folder(auth, artist_folder)
+        log(f"[{index}/{len(songs)}] 目标文件夹：{artist_folder}")
         base_filename = safe_name(f"{found['title']} - {found['artist']}.flac")
         local = work / base_filename
         try:
@@ -349,13 +357,13 @@ def main():
             log(f"[{index}/{len(songs)}] 下载完成：{actual / 1048576:.2f} MiB，检查 WebDAV 文件")
             if found["size"] and abs(actual - found["size"]) > SIZE_TOLERANCE:
                 raise RuntimeError(f"体积异常 {actual}/{found['size']}")
-            filename = choose_filename(auth, base_filename, actual)
+            filename = choose_filename(auth, base_filename, actual, subfolder=artist_folder)
             if filename is None:
                 local.unlink(missing_ok=True)
                 skipped += 1
                 log(f"[{index}/{len(songs)}] 跳过：WebDAV 已存在相同文件")
                 continue
-            upload(auth, local, filename)
+            upload(auth, local, filename, subfolder=artist_folder)
             local.unlink(missing_ok=True)
             success += 1
             log(f"[{index}/{len(songs)}] 上传完成：{filename}")
