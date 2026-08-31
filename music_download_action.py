@@ -103,7 +103,9 @@ def spotify_token():
 
 def spotify_get(path, params=None):
     r = requests.get(f"{SPOTIFY_API}/{path.lstrip('/')}", params=params, headers={"Authorization": f"Bearer {spotify_token()}"}, timeout=30)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        detail = r.text[:500].replace("\n", " ")
+        raise RuntimeError(f"Spotify API HTTP {r.status_code}: {detail}")
     return r.json()
 
 
@@ -118,7 +120,7 @@ def spotify_artist(query):
 
 def spotify_song(title, artist=None):
     q = f'track:"{title}"' + (f' artist:"{artist}"' if artist else "")
-    data = spotify_get("search", {"q": q, "type": "track", "limit": 50})
+    data = spotify_get("search", {"q": q, "type": "track", "limit": 50, "market": "US"})
     return data.get("tracks", {}).get("items", [])
 
 
