@@ -1,0 +1,41 @@
+name: music-download
+
+on:
+  repository_dispatch:
+    types: [music-download]
+  workflow_dispatch:
+    inputs:
+      payload:
+        description: JSON payload from n8n
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      PYTHONUNBUFFERED: '1'
+      WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
+      WEBDAV_USERNAME: ${{ secrets.WEBDAV_USERNAME }}
+      WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
+      WEBDAV_FOLDER: ${{ secrets.WEBDAV_FOLDER }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade requests tqdm
+
+      - name: Run music downloader
+        env:
+          EVENT_PAYLOAD: ${{ github.event.client_payload && toJSON(github.event.client_payload) || inputs.payload }}
+        run: python music_download_action.py
