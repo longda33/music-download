@@ -125,9 +125,12 @@ def lastfm_recording(row):
 
 ARTIST_ALIASES = {
     "蔡依林": "jolintsai",
+    "jolin": "jolintsai",
     "jolin tsai": "jolintsai",
     "jolintsai": "jolintsai",
     "jolin蔡依林": "jolintsai",
+    "蔡依林 (jolin tsai)": "jolintsai",
+    "蔡依林（jolin tsai）": "jolintsai",
 }
 
 
