@@ -23,8 +23,7 @@ jobs:
       WEBDAV_USERNAME: ${{ secrets.WEBDAV_USERNAME }}
       WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
       WEBDAV_FOLDER: ${{ secrets.WEBDAV_FOLDER }}
-      SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
-      SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+      LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
