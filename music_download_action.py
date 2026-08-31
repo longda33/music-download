@@ -321,8 +321,14 @@ def callback(payload):
     token = payload.get("callback_token")
     if token:
         headers["X-Callback-Token"] = token
-    result = {"chat_id": payload.get("chat_id"), "success_count": payload.get("success_count", 0), "failed_songs": payload.get("failed_songs", [])}
-    requests.post(url, headers=headers, json=result, timeout=60).raise_for_status()
+    result = {
+        "chat_id": payload.get("chat_id"),
+        "status": payload.get("status", "completed"),
+        "cancelled": payload.get("cancelled", False),
+        "success_count": payload.get("success_count", 0),
+        "failed_songs": payload.get("failed_songs", []),
+    }
+    requests.post(url, headers=headers, json=result, timeout=30).raise_for_status()
 
 
 def main():
