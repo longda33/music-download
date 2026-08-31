@@ -30,6 +30,10 @@ DETAIL_TIMEOUT = 8
 SIZE_TOLERANCE = 3 * 1024 * 1024
 
 
+def log(message):
+    print(f"[music-download] {message}", flush=True)
+
+
 def fail(message):
     raise RuntimeError(message)
 
@@ -273,40 +277,66 @@ def main():
     mode, query = payload.get("mode", "singer"), str(payload.get("query", "")).strip()
     if not query:
         fail("缺少 query")
+    log(f"开始任务：mode={mode}, query={query}")
     songs = discover_songs(mode, query)
+    log(f"目录检索完成：共 {len(songs)} 首，三人及以上合唱已过滤")
     auth = webdav_auth()
     ensure_webdav_folder(auth)
+    log("WebDAV 连接正常，开始逐首处理")
     work = Path("downloaded_music")
     work.mkdir(exist_ok=True)
     success = 0
+    skipped = 0
     failed = []
-    for original in songs:
+    for index, original in enumerate(songs, 1):
+        label = f"{original['title']} - {original['artist']}"
+        log(f"[{index}/{len(songs)}] 搜索音源：{label}")
         found = find_source(original)
         if not found:
-            failed.append(f"{original['title']} - {original['artist']}")
+            log(f"[{index}/{len(songs)}] 失败：三个音源都没有可用 FLAC")
+            failed.append(label)
             continue
+        log(f"[{index}/{len(songs)}] 找到音源：{found['source']} {found.get('quality', 'FLAC')}")
         base_filename = safe_name(f"{found['title']} - {found['artist']}.flac")
         local = work / base_filename
         try:
             r = requests.get(found["url"], headers=SOURCE_HEADERS, stream=True, timeout=300)
             r.raise_for_status()
+            total = int(r.headers.get("content-length", 0) or found.get("size", 0) or 0)
+            downloaded = 0
+            last_report = time.monotonic()
             with local.open("wb") as handle:
                 for chunk in r.iter_content(1024 * 1024):
                     if chunk:
                         handle.write(chunk)
+                        downloaded += len(chunk)
+                        now = time.monotonic()
+                        if now - last_report >= 3:
+                            if total:
+                                percent = downloaded * 100 / total
+                                log(f"[{index}/{len(songs)}] 下载进度：{downloaded / 1048576:.2f}/{total / 1048576:.2f} MiB ({percent:.1f}%)")
+                            else:
+                                log(f"[{index}/{len(songs)}] 已下载：{downloaded / 1048576:.2f} MiB")
+                            last_report = now
             actual = local.stat().st_size
+            log(f"[{index}/{len(songs)}] 下载完成：{actual / 1048576:.2f} MiB，检查 WebDAV 文件")
             if found["size"] and abs(actual - found["size"]) > SIZE_TOLERANCE:
                 raise RuntimeError(f"体积异常 {actual}/{found['size']}")
             filename = choose_filename(auth, base_filename, actual)
             if filename is None:
                 local.unlink(missing_ok=True)
+                skipped += 1
+                log(f"[{index}/{len(songs)}] 跳过：WebDAV 已存在相同文件")
                 continue
             upload(auth, local, filename)
             local.unlink(missing_ok=True)
             success += 1
-        except Exception:
+            log(f"[{index}/{len(songs)}] 上传完成：{filename}")
+        except Exception as exc:
             local.unlink(missing_ok=True)
-            failed.append(f"{original['title']} - {original['artist']}")
+            failed.append(label)
+            log(f"[{index}/{len(songs)}] 失败：{exc}")
+    log(f"任务完成：上传 {success} 首，跳过 {skipped} 首，失败 {len(failed)} 首")
     payload["success_count"] = success
     payload["failed_songs"] = failed
     callback(payload)
