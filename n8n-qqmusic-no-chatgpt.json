@@ -1,0 +1,29 @@
+{
+  "name": "音乐自动下载：Telegram → MusicBrainz → GitHub Action → WebDAV",
+  "nodes": [
+    {"parameters":{"updates":["message"],"additionalFields":{}},"id":"telegram-trigger","name":"Telegram 收到指令","type":"n8n-nodes-base.telegramTrigger","typeVersion":1.2,"position":[-900,0],"credentials":{"telegramApi":{"id":"","name":"Telegram account"}}},
+    {"parameters":{"jsCode":"const msg = $json.message || {};\nconst text = String(msg.text || '').trim();\nconst chat_id = msg.chat?.id;\nif (!text || chat_id === undefined) return [];\nif (/^\\/(start|help)$/i.test(text)) return [{json:{help:true,chat_id}}];\nlet mode = 'singer', query = text;\nconst m = text.match(/^\\/(歌手|singer|歌曲|song)\\s+(.+)$/i) || text.match(/^(歌手|歌曲|singer|song)\\s*[:：]\\s*(.+)$/i);\nif (m) { mode = /歌曲|song/i.test(m[1]) ? 'song' : 'singer'; query = m[2].trim(); }\nreturn [{json:{mode,query,chat_id:String(chat_id),callback_url:($env.N8N_PUBLIC_URL || '') + '/webhook/qqmusic-callback',callback_token:$env.CALLBACK_TOKEN || ''}}];"},"id":"parse-command","name":"解析歌手或歌曲","type":"n8n-nodes-base.code","typeVersion":2,"position":[-680,0]},
+    {"parameters":{"conditions":{"boolean":[{"value1":"={{ $json.help }}","operation":"isTrue"}]}},"id":"is-help","name":"是否帮助","type":"n8n-nodes-base.if","typeVersion":2,"position":[-460,0]},
+    {"parameters":{"chatId":"={{ $json.chat_id }}","text":"用法：\n歌手 周杰伦\n歌曲 晴天\n\n歌手模式自动忽略三人及以上合唱；歌曲模式自动检索不同演唱版本。"},"id":"send-help","name":"发送帮助","type":"n8n-nodes-base.telegram","typeVersion":1.2,"position":[-220,-160],"credentials":{"telegramApi":{"id":"","name":"Telegram account"}}},
+    {"parameters":{"jsCode":"if (!$json.callback_url) throw new Error('N8N_PUBLIC_URL 未配置');\nreturn [{json:{event_type:'music-download',client_payload:{mode:$json.mode,query:$json.query,chat_id:$json.chat_id,callback_url:$json.callback_url,callback_token:$json.callback_token}}}];"},"id":"build-payload","name":"生成 Action 参数","type":"n8n-nodes-base.code","typeVersion":2,"position":[-220,100]},
+    {"parameters":{"method":"POST","url":"={{ 'https://api.github.com/repos/' + $env.GITHUB_OWNER + '/' + $env.GITHUB_REPO + '/dispatches' }}","sendHeaders":true,"headerParameters":{"parameters":[{"name":"Authorization","value":"=Bearer {{ $env.GITHUB_TOKEN }}"},{"name":"Accept","value":"application/vnd.github+json"},{"name":"X-GitHub-Api-Version","value":"2022-11-28"},{"name":"Content-Type","value":"application/json"}]},"sendBody":true,"specifyBody":"json","jsonBody":"={{ JSON.stringify($json) }}","options":{"timeout":30000}},"id":"github-dispatch","name":"触发 music-download Action","type":"n8n-nodes-base.httpRequest","typeVersion":4.2,"position":[40,100]},
+    {"parameters":{"chatId":"={{ $('解析歌手或歌曲').first().json.chat_id }}","text":"已收到请求。GitHub Action 将通过 MusicBrainz 自动检索曲目，再按 QQ音乐 → 酷我音乐 → 网易云音乐顺序寻找 FLAC 并上传 WebDAV，完成后发送结果。"},"id":"send-started","name":"发送开始通知","type":"n8n-nodes-base.telegram","typeVersion":1.2,"position":[280,100],"credentials":{"telegramApi":{"id":"","name":"Telegram account"}}},
+    {"parameters":{"httpMethod":"POST","path":"qqmusic-callback","responseMode":"onReceived","options":{}},"id":"callback-webhook","name":"Action 完成回调","type":"n8n-nodes-base.webhook","typeVersion":2.1,"position":[-900,420]},
+    {"parameters":{"jsCode":"const b=$json.body||$json;\nconst expected=$env.CALLBACK_TOKEN||'';\nconst supplied=$headers['x-callback-token']||$headers['X-Callback-Token']||'';\nif (expected && supplied !== expected) throw new Error('非法回调');\nconst failed=Array.isArray(b.failed_songs)?b.failed_songs:[];\nreturn [{json:{chat_id:String(b.chat_id),text:'下载完成\\n成功：'+Number(b.success_count||0)+' 首'+(failed.length?'\\n失败歌曲：\\n'+failed.join('\\n'):'')}}];"},"id":"format-result","name":"整理回报","type":"n8n-nodes-base.code","typeVersion":2,"position":[-650,420]},
+    {"parameters":{"chatId":"={{ $json.chat_id }}","text":"={{ $json.text }}"},"id":"send-result","name":"发送完成结果","type":"n8n-nodes-base.telegram","typeVersion":1.2,"position":[-400,420],"credentials":{"telegramApi":{"id":"","name":"Telegram account"}}}
+  ],
+  "connections":{
+    "Telegram 收到指令":{"main":[[{"node":"解析歌手或歌曲","type":"main","index":0}]]},
+    "解析歌手或歌曲":{"main":[[{"node":"是否帮助","type":"main","index":0}]]},
+    "是否帮助":{"main":[[{"node":"发送帮助","type":"main","index":0}],[{"node":"生成 Action 参数","type":"main","index":0}]]},
+    "生成 Action 参数":{"main":[[{"node":"触发 music-download Action","type":"main","index":0}]]},
+    "触发 music-download Action":{"main":[[{"node":"发送开始通知","type":"main","index":0}]]},
+    "Action 完成回调":{"main":[[{"node":"整理回报","type":"main","index":0}]]},
+    "整理回报":{"main":[[{"node":"发送完成结果","type":"main","index":0}]]}
+  },
+  "active":false,
+  "settings":{"executionOrder":"v1"},
+  "versionId":"qqmusic-n8n-no-chatgpt-v1",
+  "meta":{"templateCredsSetupCompleted":false},
+  "tags":[]
+}
