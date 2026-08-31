@@ -4,6 +4,7 @@
 import json
 import os
 import re
+import signal
 import sys
 import time
 from pathlib import Path
@@ -32,6 +33,28 @@ SIZE_TOLERANCE = 3 * 1024 * 1024
 
 def log(message):
     print(f"[music-download] {message}", flush=True)
+
+
+ACTIVE_PAYLOAD = None
+
+
+def handle_cancel(signum, frame):
+    if ACTIVE_PAYLOAD is not None:
+        log("收到 GitHub 取消信号，正在回调 n8n")
+        ACTIVE_PAYLOAD["status"] = "cancelled"
+        ACTIVE_PAYLOAD["cancelled"] = True
+        ACTIVE_PAYLOAD.setdefault("success_count", 0)
+        ACTIVE_PAYLOAD.setdefault("failed_songs", [])
+        try:
+            callback(ACTIVE_PAYLOAD)
+            log("取消状态已回调 n8n")
+        except Exception as exc:
+            log(f"取消回调失败：{exc}")
+    raise SystemExit(0)
+
+
+signal.signal(signal.SIGTERM, handle_cancel)
+signal.signal(signal.SIGINT, handle_cancel)
 
 
 def fail(message):
@@ -251,10 +274,12 @@ def choose_filename(auth, base_filename, size):
 
 
 def upload(auth, local_path, filename):
+    url = webdav_path(filename)
+    log(f"WebDAV PUT：{filename}")
     with local_path.open("rb") as handle:
-        r = requests.put(webdav_path(filename), auth=auth, data=handle, headers={"Content-Length": str(local_path.stat().st_size), "Content-Type": "audio/flac"}, timeout=600)
+        r = requests.put(url, auth=auth, data=handle, headers={"Content-Length": str(local_path.stat().st_size), "Content-Type": "audio/flac"}, timeout=600)
     if r.status_code not in (200, 201, 204):
-        r.raise_for_status()
+        raise RuntimeError(f"WebDAV PUT 失败 HTTP {r.status_code}: {url}")
 
 
 def callback(payload):
@@ -270,10 +295,12 @@ def callback(payload):
 
 
 def main():
+    global ACTIVE_PAYLOAD
     raw = os.getenv("EVENT_PAYLOAD", "")
     if not raw:
         fail("EVENT_PAYLOAD 为空")
     payload = json.loads(raw) if isinstance(raw, str) else raw
+    ACTIVE_PAYLOAD = payload
     mode, query = payload.get("mode", "singer"), str(payload.get("query", "")).strip()
     if not query:
         fail("缺少 query")
