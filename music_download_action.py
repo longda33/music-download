@@ -278,13 +278,39 @@ def choose_filename(auth, base_filename, size, subfolder=None):
     return f"{stem} [{size / (1024 * 1024):.2f}MB] ({n}){ext}"
 
 
+def remote_size(auth, url):
+    try:
+        head = requests.head(url, auth=auth, timeout=30, allow_redirects=True)
+        if head.status_code in (200, 204) and head.headers.get("content-length"):
+            return int(head.headers["content-length"])
+    except Exception:
+        pass
+    try:
+        r = requests.request("PROPFIND", url, auth=auth, headers={"Depth": "0"}, timeout=30)
+        if r.status_code in (200, 207):
+            root = __import__("xml.etree.ElementTree", fromlist=["ElementTree"]).fromstring(r.content)
+            ns = {"d": "DAV:"}
+            value = root.findtext(".//d:getcontentlength", default="", namespaces=ns)
+            return int(value) if value else None
+    except Exception:
+        pass
+    return None
+
+
 def upload(auth, local_path, filename, subfolder=None):
     url = webdav_path(filename, subfolder=subfolder)
+    expected = local_path.stat().st_size
     log(f"WebDAV PUT：{filename}")
     with local_path.open("rb") as handle:
-        r = requests.put(url, auth=auth, data=handle, headers={"Content-Length": str(local_path.stat().st_size), "Content-Type": "audio/flac"}, timeout=600)
-    if r.status_code not in (200, 201, 204):
-        raise RuntimeError(f"WebDAV PUT 失败 HTTP {r.status_code}: {url}")
+        r = requests.put(url, auth=auth, data=handle, headers={"Content-Length": str(expected), "Content-Type": "audio/flac"}, timeout=600)
+    if r.status_code in (200, 201, 204):
+        return
+    if r.status_code == 405:
+        actual = remote_size(auth, url)
+        if actual == expected:
+            log(f"WebDAV 返回 405，但远程文件已确认存在：{filename}")
+            return
+    raise RuntimeError(f"WebDAV PUT 失败 HTTP {r.status_code}: {url}")
 
 
 def callback(payload):
