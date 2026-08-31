@@ -22,9 +22,9 @@ except ImportError:
     KUWO_API = "https://oiapi.net/api/Kuwo"
     NETEASE_API = "https://api.qijieya.cn/meting/"
 
-SPOTIFY_API = "https://api.spotify.com/v1"
-SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
-SPOTIFY_TOKEN = None
+MB_API = "https://musicbrainz.org/ws/2"
+MB_HEADERS = {"User-Agent": "music-download-action/1.0 (n8n workflow)"}
+LASTFM_API = "https://ws.audioscrobbler.com/2.0/"
 SOURCE_HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*"}
 RETRIES = 3
 SOURCE_TIMEOUT = 12
@@ -77,7 +77,6 @@ def request_json(url, params=None, headers=None, timeout=60, retries=RETRIES):
 
 
 def one_artist(credit):
-    """返回单人或双人演唱者；三人及以上合唱返回 None。"""
     names = []
     for item in credit or []:
         artist = item.get("artist", {})
@@ -87,80 +86,84 @@ def one_artist(credit):
     return " & ".join(names) if 1 <= len(names) <= 2 else None
 
 
-def spotify_token():
-    global SPOTIFY_TOKEN
-    if SPOTIFY_TOKEN:
-        return SPOTIFY_TOKEN
-    client_id = os.getenv("SPOTIFY_CLIENT_ID")
-    client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
-    if not client_id or not client_secret:
-        fail("缺少 Spotify Secret: SPOTIFY_CLIENT_ID、SPOTIFY_CLIENT_SECRET")
-    r = requests.post(SPOTIFY_TOKEN_URL, auth=(client_id, client_secret), data={"grant_type": "client_credentials"}, timeout=30)
+def mb_get(path, params):
+    time.sleep(1.1)
+    return request_json(f"{MB_API}/{path}", params={**params, "fmt": "json"}, headers=MB_HEADERS)
+
+
+def lastfm_get(method, params):
+    api_key = os.getenv("LASTFM_API_KEY")
+    if not api_key:
+        fail("缺少 LASTFM_API_KEY")
+    query = {"method": method, "api_key": api_key, "format": "json", **params}
+    r = requests.get(LASTFM_API, params=query, timeout=30)
     r.raise_for_status()
-    SPOTIFY_TOKEN = r.json()["access_token"]
-    return SPOTIFY_TOKEN
+    data = r.json()
+    if data.get("error"):
+        raise RuntimeError(f"Last.fm API 错误 {data['error']}: {data.get('message', '')}")
+    return data
 
 
-def spotify_get(path, params=None):
-    r = requests.get(f"{SPOTIFY_API}/{path.lstrip('/')}", params=params, headers={"Authorization": f"Bearer {spotify_token()}"}, timeout=30)
-    if r.status_code >= 400:
-        detail = r.text[:500].replace("\n", " ")
-        raise RuntimeError(f"Spotify API HTTP {r.status_code}: {detail}")
-    return r.json()
-
-
-def spotify_artist(query):
-    data = spotify_get("search", {"q": f'artist:"{query}"', "type": "artist", "limit": 10})
-    artists = data.get("artists", {}).get("items", [])
-    if not artists:
+def lastfm_recording(row):
+    if not isinstance(row, dict):
         return None
-    exact = [a for a in artists if str(a.get("name", "")).casefold() == query.casefold()]
-    return (exact or artists)[0]
-
-
-def spotify_song(title, artist=None):
-    q = f'track:"{title}"' + (f' artist:"{artist}"' if artist else "")
-    data = spotify_get("search", {"q": q, "type": "track", "limit": 50, "market": "US"})
-    return data.get("tracks", {}).get("items", [])
-
-
-def spotify_recording(track):
-    artists = " & ".join(a.get("name", "") for a in track.get("artists", []) if a.get("name"))
-    return {"title": track.get("name", "").strip(), "artist": artists, "year": (track.get("album", {}).get("release_date") or "")[:4], "spotify_id": track.get("id")}
+    title = str(row.get("name", "")).strip()
+    artist = str(row.get("artist", "")).strip()
+    return {"title": title, "artist": artist, "year": None, "lastfm_url": row.get("url")} if title and artist else None
 
 
 def discover_songs(mode, query):
     songs = []
-    if mode == "singer":
-        artist = spotify_artist(query)
-        if not artist:
-            return []
-        offset = 0
-        seen_albums = set()
-        while offset < 1000:
-            page = spotify_get("artists/{}/albums".format(artist["id"]), {"include_groups": "album,single,compilation", "limit": 50, "offset": offset, "market": "US"})
-            albums = page.get("items", [])
-            if not albums:
-                break
-            for album in albums:
-                album_id = album.get("id")
-                if not album_id or album_id in seen_albums:
-                    continue
-                seen_albums.add(album_id)
-                tracks = spotify_get("albums/{}/tracks".format(album_id), {"limit": 50, "market": "US"}).get("items", [])
-                for track in tracks:
-                    if track.get("artists"):
-                        songs.append(spotify_recording(track))
-            offset += len(albums)
-            if len(albums) < 50:
-                break
-    else:
-        songs = [spotify_recording(t) for t in spotify_song(query) if t.get("artists")]
+    # MusicBrainz：较完整的目录来源
+    try:
+        if mode == "singer":
+            found = mb_get("artist", {"query": f'artist:"{query}"', "limit": 5})
+            artists = found.get("artists", [])
+            if artists:
+                mbid = artists[0]["id"]
+                offset = 0
+                while offset < 1000:
+                    page = mb_get("recording", {"artist": mbid, "limit": 100, "offset": offset})
+                    rows = page.get("recordings", [])
+                    if not rows:
+                        break
+                    for row in rows:
+                        artist = one_artist(row.get("artist-credit"))
+                        if artist and row.get("title"):
+                            songs.append({"title": row["title"].strip(), "artist": artist, "year": None, "mbid": row.get("id")})
+                    offset += len(rows)
+                    if len(rows) < 100:
+                        break
+        else:
+            found = mb_get("recording", {"query": f'recording:"{query}"', "limit": 100})
+            for row in found.get("recordings", []):
+                artist = one_artist(row.get("artist-credit"))
+                title = row.get("title", "").strip()
+                if artist and title.casefold() == query.casefold():
+                    songs.append({"title": title, "artist": artist, "year": None, "mbid": row.get("id")})
+    except Exception as exc:
+        log(f"MusicBrainz 暂不可用，继续使用 Last.fm：{exc}")
+
+    # Last.fm：补充热门歌曲及不同演唱版本
+    try:
+        if mode == "singer":
+            data = lastfm_get("artist.getTopTracks", {"artist": query, "limit": 100, "page": 1, "autocorrect": 1})
+            rows = data.get("toptracks", {}).get("track", [])
+        else:
+            data = lastfm_get("track.search", {"track": query, "limit": 100, "page": 1})
+            rows = data.get("results", {}).get("trackmatches", {}).get("track", [])
+        for row in rows:
+            item = lastfm_recording(row)
+            if item:
+                songs.append(item)
+    except Exception as exc:
+        log(f"Last.fm 暂不可用，继续使用 MusicBrainz：{exc}")
 
     seen = set()
     result = []
     for song in songs:
-        if not song["title"] or not one_artist([{"artist": {"name": n}} for n in song["artist"].split(" & ")]):
+        artists = [{"artist": {"name": name.strip()}} for name in song["artist"].split(" & ") if name.strip()]
+        if not song["title"] or not one_artist(artists):
             continue
         key = (song["title"].casefold(), song["artist"].casefold())
         if key not in seen:
