@@ -163,8 +163,63 @@ def identity_keys(song):
     return keys
 
 
+def platform_discover(query):
+    """从实时音源目录发现歌曲，不依赖 MusicBrainz 收录。"""
+    candidates = []
+    parts = query.split()
+    pair_terms = []
+    if len(parts) >= 2:
+        for cut in range(1, len(parts)):
+            left, right = " ".join(parts[:cut]), " ".join(parts[cut:])
+            pair_terms.extend([(left, right), (right, left)])
+
+    def accept(title, artist):
+        title, artist = str(title or "").strip(), str(artist or "").strip()
+        if not title or not artist:
+            return False
+        if len(parts) == 1:
+            return True
+        return any(canonical_title(title) == canonical_title(t)
+                   and canonical_artist(artist) == canonical_artist(a)
+                   for t, a in pair_terms)
+
+    try:
+        rows = request_json(QQ_API, {"msg": query, "type": "json"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=1)
+        for row in rows if isinstance(rows, list) else []:
+            title = row.get("song_title") or row.get("song_name")
+            artist = row.get("singer_name")
+            if accept(title, artist):
+                candidates.append({"title": title, "artist": artist, "artist_ids": [], "recording_id": None, "isrc": None, "year": None})
+    except Exception as exc:
+        log(f"QQ 实时目录搜索失败：{exc}")
+
+    try:
+        data = request_json(KUWO_API, {"msg": query, "page": 1, "limit": 100}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=1)
+        rows = data.get("data", []) if isinstance(data, dict) else []
+        for row in rows:
+            title, artist = row.get("song"), row.get("singer")
+            if accept(title, artist):
+                candidates.append({"title": title, "artist": artist, "artist_ids": [], "recording_id": None, "isrc": None, "year": None})
+    except Exception as exc:
+        log(f"酷我实时目录搜索失败：{exc}")
+
+    try:
+        data = request_json(NETEASE_API, {"type": "search", "id": query, "limit": 100, "page": 1, "server": "netease"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=1)
+        rows = data if isinstance(data, list) else []
+        for row in rows:
+            title, artist = row.get("name"), row.get("artist")
+            if accept(title, artist):
+                candidates.append({"title": title, "artist": artist, "artist_ids": [], "recording_id": None, "isrc": None, "year": None})
+    except Exception as exc:
+        log(f"网易云实时目录搜索失败：{exc}")
+    return candidates
+
+
 def discover_songs(mode, query):
     songs = []
+    if mode == "search":
+        songs.extend(platform_discover(query))
+        log(f"实时音源目录初步发现：{len(songs)} 首")
     # MusicBrainz：较完整的目录来源
     try:
         if mode == "singer":
@@ -185,6 +240,62 @@ def discover_songs(mode, query):
                     offset += len(rows)
                     if len(rows) < 100:
                         break
+        elif mode == "search":
+            # 两个搜索项=歌曲+歌手，只下载一首；一个搜索项=宽搜，全部下载。
+            parts = query.split()
+            if len(parts) == 1:
+                # 单项可能是歌手名：优先抓取该艺人的完整目录。
+                artist_found = mb_get("artist", {"query": f'artist:"{query}"', "limit": 5})
+                artists = artist_found.get("artists", [])
+                if artists:
+                    mbid = artists[0].get("id")
+                    offset = 0
+                    while mbid and offset < 1000:
+                        page = mb_get("recording", {"artist": mbid, "limit": 100, "offset": offset, "inc": "isrcs"})
+                        rows = page.get("recordings", [])
+                        if not rows:
+                            break
+                        for row in rows:
+                            artist, artist_ids = artist_credit_info(row.get("artist-credit"))
+                            if artist and row.get("title"):
+                                songs.append({"title": row["title"].strip(), "artist": artist, "artist_ids": artist_ids, "recording_id": row.get("id"), "isrc": (row.get("isrcs") or [None])[0], "year": None})
+                        offset += len(rows)
+                        if len(rows) < 100:
+                            break
+                # 同时补充单个歌曲名的全部演唱版本。
+                found = mb_get("recording", {"query": f'recording:"{query}"', "limit": 100, "inc": "artists+isrcs"})
+                for row in found.get("recordings", []):
+                    artist, artist_ids = artist_credit_info(row.get("artist-credit"))
+                    title = row.get("title", "").strip()
+                    if artist and title and canonical_title(title) == canonical_title(query):
+                        songs.append({"title": title, "artist": artist, "artist_ids": artist_ids, "recording_id": row.get("id"), "isrc": (row.get("isrcs") or [None])[0], "year": None})
+            else:
+                # 支持“歌名 歌手名”和“歌手名 歌名”；尝试每个空格切分的两种顺序。
+                queries = []
+                queries = []
+                for cut in range(1, len(parts)):
+                    left, right = " ".join(parts[:cut]), " ".join(parts[cut:])
+                    queries.extend([(left, right), (right, left)])
+                for title_part, artist_part in queries:
+                    lucene = f'recording:"{title_part}"'
+                    if artist_part:
+                        lucene += f' AND artist:"{artist_part}"'
+                    found = mb_get("recording", {"query": lucene, "limit": 20, "inc": "artists+isrcs"})
+                    for row in found.get("recordings", []):
+                        artist, artist_ids = artist_credit_info(row.get("artist-credit"))
+                        title = row.get("title", "").strip()
+                        if artist and title:
+                            songs.append({"title": title, "artist": artist, "artist_ids": artist_ids, "recording_id": row.get("id"), "isrc": (row.get("isrcs") or [None])[0], "year": None})
+                    if songs:
+                        break
+            try:
+                data = lastfm_get("track.search", {"track": query, "limit": 20, "page": 1})
+                for row in data.get("results", {}).get("trackmatches", {}).get("track", []):
+                    item = lastfm_recording(row)
+                    if item:
+                        songs.append(item)
+            except Exception as exc:
+                log(f"Last.fm 搜索失败，使用 MusicBrainz 结果：{exc}")
         else:
             found = mb_get("recording", {"query": f'recording:"{query}"', "limit": 100, "inc": "isrcs"})
             for row in found.get("recordings", []):
@@ -297,14 +408,20 @@ def netease_search(title, artist):
 
 
 def find_source(song):
+    found = []
     for func in (qq_search, kuwo_search, netease_search):
         try:
-            found = func(song["title"], song["artist"])
-            if found:
-                return {**song, **found}
-        except Exception:
-            continue
-    return None
+            item = func(song["title"], song["artist"])
+            if item:
+                found.append({**song, **item})
+        except Exception as exc:
+            log(f"{func.__name__} 搜索失败：{exc}")
+    if not found:
+        return None
+    # 只选一首：SQ 优先，其次其他真实 FLAC；同质量按 QQ→酷我→网易云。
+    quality_rank = {"SQ": 3, "FLAC": 2, "PQ": 1}
+    source_rank = {"QQ": 3, "酷我": 2, "网易云": 1}
+    return max(found, key=lambda x: (quality_rank.get(x.get("quality"), 0), source_rank.get(x.get("source"), 0)))
 
 
 def safe_name(value):
@@ -437,6 +554,8 @@ def main():
         fail("缺少 query")
     log(f"开始任务：mode={mode}, query={query}")
     songs = discover_songs(mode, query)
+    if mode == "search" and len(query.split()) >= 2:
+        songs = songs[:1]
     log(f"目录检索完成：共 {len(songs)} 首，三人及以上合唱已过滤")
     auth = webdav_auth()
     ensure_webdav_folder(auth)
