@@ -14,6 +14,12 @@ from urllib.parse import quote
 import requests
 
 try:
+    from opencc import OpenCC
+    TRAD_TO_SIMP = OpenCC("t2s")
+except ImportError:
+    TRAD_TO_SIMP = None
+
+try:
     import syy  # syy.py must be in the repository root
     QQ_API = syy.TANG_API
     KUWO_API = syy.KUWO_API
@@ -131,6 +137,18 @@ ARTIST_ALIASES = {
     "jolin蔡依林": "jolintsai",
     "蔡依林 (jolin tsai)": "jolintsai",
     "蔡依林（jolin tsai）": "jolintsai",
+    "赵露思": "zhaolusi",
+    "rosy": "zhaolusi",
+    "rosy zhao": "zhaolusi",
+    "赵露思 rosy": "zhaolusi",
+    "赵露思 (rosy)": "zhaolusi",
+    "赵露思(rosy)": "zhaolusi",
+    "赵露思（rosy）": "zhaolusi",
+}
+
+ARTIST_FOLDER_NAMES = {
+    "jolintsai": "蔡依林",
+    "zhaolusi": "赵露思",
 }
 
 
@@ -139,14 +157,28 @@ def dedup_key(value):
     return "".join(ch for ch in value if ch.isalnum())
 
 
+def to_simplified(value):
+    value = str(value or "")
+    if TRAD_TO_SIMP is not None:
+        return TRAD_TO_SIMP.convert(value)
+    # GitHub Action 会安装 OpenCC；此表仅作为依赖异常时的保底。
+    return value.translate(str.maketrans("趙露思周杰倫林憶蓮張信哲蔡依林樂門國體風學這個後臺", "赵露思周杰伦林忆莲张信哲蔡依林乐门国体风学这个后台"))
+
+
 def canonical_artist(value):
-    raw = unicodedata.normalize("NFKC", str(value)).strip().casefold()
+    raw = unicodedata.normalize("NFKC", to_simplified(value)).strip().casefold()
     compact = dedup_key(raw)
     return ARTIST_ALIASES.get(raw, ARTIST_ALIASES.get(compact, compact))
 
 
 def canonical_title(value):
     return dedup_key(value)
+
+
+def artist_folder_name(value):
+    """将中英文艺人别名统一为稳定的文件夹名称。"""
+    key = canonical_artist(value)
+    return ARTIST_FOLDER_NAMES.get(key, to_simplified(str(value).strip()))
 
 
 def identity_keys(song):
@@ -590,7 +622,7 @@ def main():
             failed.append(label)
             continue
         log(f"[{index}/{len(songs)}] 找到音源：{found['source']} {found.get('quality', 'FLAC')}")
-        artist_folder = safe_name(found["artist"])
+        artist_folder = safe_name(artist_folder_name(found["artist"]))
         ensure_webdav_folder(auth, artist_folder)
         log(f"[{index}/{len(songs)}] 目标文件夹：{artist_folder}")
         base_filename = safe_name(f"{found['title']} - {found['artist']}.flac")
