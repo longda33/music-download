@@ -523,13 +523,12 @@ def netease_metadata(title, artist):
 
 
 def embed_metadata(local_path, song):
-    """将歌曲信息、歌词和封面写入 FLAC；元数据失败不影响上传。"""
-    if FLAC is None:
-        log("未安装 mutagen，跳过歌曲元数据封装")
-        return
+    """将歌曲信息、歌词和封面写入 FLAC，并验证写入结果。"""
+    if FLAC is None or Picture is None:
+        raise RuntimeError("未安装 mutagen，无法封装歌曲元数据")
+    title, artist = song.get("title", ""), song.get("artist", "")
     try:
         audio = FLAC(str(local_path))
-        title, artist = song.get("title", ""), song.get("artist", "")
         audio["title"] = [title]
         audio["artist"] = [artist]
         if song.get("album"):
@@ -543,20 +542,17 @@ def embed_metadata(local_path, song):
         if netease.get("lyrics"):
             audio["lyrics"] = [netease["lyrics"]]
         if netease.get("cover_url"):
-            try:
-                cover = requests.get(netease["cover_url"], headers=SOURCE_HEADERS, timeout=30)
-                cover.raise_for_status()
-                picture = Picture()
-                picture.type = 3
-                picture.mime = cover.headers.get("Content-Type", "image/jpeg").split(";")[0]
-                picture.desc = "Cover"
-                picture.data = cover.content
-                audio.clear_pictures()
-                audio.add_picture(picture)
-            except Exception as exc:
-                log(f"网易云封面下载失败，继续回退：{exc}")
+            cover = requests.get(netease["cover_url"], headers=SOURCE_HEADERS, timeout=30)
+            cover.raise_for_status()
+            picture = Picture()
+            picture.type = 3
+            picture.mime = cover.headers.get("Content-Type", "image/jpeg").split(";")[0]
+            picture.desc = "Cover"
+            picture.data = cover.content
+            audio.clear_pictures()
+            audio.add_picture(picture)
 
-        # 网易云无结果时，Last.fm 提供封面和专辑信息；没有 API key 时安全跳过。
+        # 网易云无结果时，Last.fm 提供封面和专辑信息。
         info = {}
         if os.getenv("LASTFM_API_KEY"):
             try:
@@ -578,23 +574,32 @@ def embed_metadata(local_path, song):
                     audio.clear_pictures()
                     audio.add_picture(picture)
             except Exception as exc:
-                log(f"封面/专辑信息获取失败，继续封装其它信息：{exc}")
+                log(f"Last.fm 封面/专辑信息获取失败：{exc}")
 
-        # LRCLIB 无需密钥；优先写同步歌词，找不到则写纯文本歌词。
-        try:
-            lyric = requests.get("https://lrclib.net/api/get", params={"track_name": title, "artist_name": artist}, timeout=30)
-            if lyric.status_code == 200:
-                lyric_data = lyric.json()
-                lyrics = lyric_data.get("syncedLyrics") or lyric_data.get("plainLyrics")
-                if lyrics and not netease.get("lyrics"):
-                    audio["lyrics"] = [lyrics]
-        except Exception as exc:
-            log(f"歌词获取失败，继续上传：{exc}")
+        # LRCLIB 作为网易云无歌词时的补充。
+        if not netease.get("lyrics"):
+            try:
+                lyric = requests.get("https://lrclib.net/api/get", params={"track_name": title, "artist_name": artist}, timeout=30)
+                if lyric.status_code == 200:
+                    lyric_data = lyric.json()
+                    lyrics = lyric_data.get("syncedLyrics") or lyric_data.get("plainLyrics")
+                    if lyrics:
+                        audio["lyrics"] = [lyrics]
+            except Exception as exc:
+                log(f"LRCLIB 歌词获取失败：{exc}")
         audio.save()
-        log(f"元数据封装完成：{title} - {artist}")
-    except Exception as exc:
-        log(f"FLAC 元数据封装失败，继续上传原文件：{exc}")
 
+        # 重新打开验证，禁止未封装文件继续上传。
+        verified = FLAC(str(local_path))
+        if verified.get("title", [""])[0] != title or verified.get("artist", [""])[0] != artist:
+            raise RuntimeError("FLAC 标题或歌手验证失败")
+        if netease.get("lyrics") and not verified.get("lyrics"):
+            raise RuntimeError("网易云歌词未写入 FLAC")
+        if netease.get("cover_url") and not verified.pictures:
+            raise RuntimeError("网易云封面未写入 FLAC")
+        log(f"元数据封装并验证完成：{title} - {artist}（歌词={'有' if verified.get('lyrics') else '无'}，封面={'有' if verified.pictures else '无'}）")
+    except Exception as exc:
+        raise RuntimeError(f"FLAC 元数据封装失败：{exc}") from exc
 
 def safe_name(value):
     value = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", str(value)).strip().rstrip(" .")
