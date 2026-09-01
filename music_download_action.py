@@ -837,7 +837,7 @@ def main():
         ensure_webdav_folder(auth, artist_folder)
         log(f"[{index}/{len(songs)}] 目标文件夹：{artist_folder}")
         filename_title = safe_name(str(found.get("filename_title") or original["title"]).strip())
-        base_filename = safe_name(f"{filename_title} - {original['artist']}.flac")
+        base_filename = safe_name(f"{filename_title} {original['artist']}.flac")
         local = work / base_filename
         try:
             r = requests.get(found["url"], headers=SOURCE_HEADERS, stream=True, timeout=300)
