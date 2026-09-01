@@ -172,6 +172,20 @@ def to_simplified(value):
     return value.translate(str.maketrans("趙露思周杰倫林憶蓮張信哲蔡依林樂門國體風學這個後臺", "赵露思周杰伦林忆莲张信哲蔡依林乐门国体风学这个后台"))
 
 
+def is_chinese_song(title, artist):
+    """标题或歌手包含汉字时，按中文歌曲处理歌词。"""
+    return bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", f"{title} {artist}"))
+
+
+def simplify_chinese_lyrics(lyrics, title, artist):
+    """中文歌曲统一为简体；含中文的双语歌词全部保留，外文歌曲原样保留。"""
+    lyrics = str(lyrics or "").replace("\r\n", "\n").replace("\r", "\n")
+    if not lyrics or not is_chinese_song(title, artist):
+        return lyrics.strip()
+    # 中文歌曲只转换繁体，不删除任何歌词行；双语歌词中的外文同步保留。
+    return to_simplified(lyrics).strip()
+
+
 def canonical_artist(value):
     raw = unicodedata.normalize("NFKC", to_simplified(value)).strip().casefold()
     compact = dedup_key(raw)
@@ -532,7 +546,7 @@ def netease_metadata(title, artist):
             if lyric_url:
                 lyric = requests.get(lyric_url, headers=SOURCE_HEADERS, timeout=DETAIL_TIMEOUT)
                 if lyric.ok:
-                    lyrics = lyric.text.strip()
+                    lyrics = simplify_chinese_lyrics(lyric.text, title, artist)
             log(f"网易云歌曲信息已找到：{row_title} - {row_artist}（歌词={'有' if lyrics else '无'}，封面={'有' if cover_url else '无'}）")
             return {"album": str(row.get("album") or ""), "cover_url": cover_url, "lyrics": lyrics}
         log(f"网易云未匹配到歌曲信息：{title} - {artist}")
@@ -605,6 +619,7 @@ def embed_metadata(local_path, song):
                 if lyric.status_code == 200:
                     lyric_data = lyric.json()
                     lyrics = lyric_data.get("syncedLyrics") or lyric_data.get("plainLyrics")
+                    lyrics = simplify_chinese_lyrics(lyrics, title, artist)
                     if lyrics:
                         audio["lyrics"] = [lyrics]
             except Exception as exc:
