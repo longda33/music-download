@@ -771,10 +771,14 @@ def upload(auth, local_path, filename, subfolder=None):
     if r.status_code in (200, 201, 204):
         return
     if r.status_code == 405:
-        # 当前 WebDAV 服务实际已写入文件，但对 PUT 返回 405。
-        # 目录中的同名文件由 choose_filename/远端覆盖逻辑负责处理。
-        log(f"WebDAV 返回 405，按已上传处理：{filename}")
-        return
+        # 部分服务 PUT 后返回 405；等待远端目录刷新，再严格确认文件存在。
+        for attempt in range(3):
+            if verify_webdav_upload(auth, url, filename, expected, subfolder=subfolder):
+                log(f"WebDAV 返回 405，但远程文件已确认存在：{filename}")
+                return
+            if attempt < 2:
+                time.sleep(3)
+        raise RuntimeError(f"WebDAV PUT 返回 405，远程未找到文件：{url}")
     raise RuntimeError(f"WebDAV PUT 失败 HTTP {r.status_code}: {url}")
 
 
