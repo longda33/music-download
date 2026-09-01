@@ -722,6 +722,23 @@ def remote_size(auth, url):
     return None
 
 
+def verify_webdav_upload(auth, url, filename, expected, subfolder=None):
+    """验证 PUT 非 2xx 后文件是否实际已写入 WebDAV。"""
+    actual = remote_size(auth, url)
+    if actual is not None and actual == expected:
+        return True
+    try:
+        # 某些 WebDAV 服务对文件地址的 HEAD/PROPFIND 返回 405，
+        # 但父目录 Depth:1 查询可以正常列出刚写入的文件。
+        files = webdav_listing(auth, subfolder=subfolder)
+        listed = files.get(filename)
+        if listed is not None and listed == expected:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def upload(auth, local_path, filename, subfolder=None):
     url = webdav_path(filename, subfolder=subfolder)
     expected = local_path.stat().st_size
@@ -730,11 +747,9 @@ def upload(auth, local_path, filename, subfolder=None):
         r = requests.put(url, auth=auth, data=handle, headers={"Content-Length": str(expected), "Content-Type": "audio/flac"}, timeout=600)
     if r.status_code in (200, 201, 204):
         return
-    if r.status_code == 405:
-        actual = remote_size(auth, url)
-        if actual == expected:
-            log(f"WebDAV 返回 405，但远程文件已确认存在：{filename}")
-            return
+    if r.status_code == 405 and verify_webdav_upload(auth, url, filename, expected, subfolder=subfolder):
+        log(f"WebDAV 返回 405，但远程文件已确认存在：{filename}")
+        return
     raise RuntimeError(f"WebDAV PUT 失败 HTTP {r.status_code}: {url}")
 
 
