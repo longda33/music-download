@@ -400,11 +400,12 @@ def qq_search(title, artist):
         if not isinstance(row, dict) or not row.get("song_mid"):
             continue
         detail = request_json(QQ_API, {"mid": row["song_mid"]}, SOURCE_HEADERS, timeout=DETAIL_TIMEOUT, retries=1)
+        source_title = str(detail.get("song_title") or detail.get("song_name") or row.get("song_title") or title).strip()
         for tier, label in (("sq", "SQ"), ("pq", "PQ")):
             url = detail.get(f"song_play_url_{tier}")
             filename = detail.get(f"song_filename_{tier}")
             if url and filename and str(filename).lower().endswith(".flac"):
-                return {"url": url, "filename": filename, "size": int(detail.get(f"song_size_{tier}_str") or 0), "source": "QQ", "quality": label}
+                return {"url": url, "filename": filename, "filename_title": source_title, "size": int(detail.get(f"song_size_{tier}_str") or 0), "source": "QQ", "quality": label}
     return None
 
 
@@ -459,7 +460,7 @@ def kuwo_search(title, artist):
         url = item.get("url") if isinstance(item, dict) else ""
         fmt = str(item.get("format", "")).lower() if isinstance(item, dict) else ""
         if url and fmt == "flac" and str(url).lower().split("?")[0].endswith(".flac"):
-            return {"url": url, "filename": f"{title}.flac", "size": size_bytes(item.get("size", "")), "source": "酷我", "quality": f"FLAC {item.get('bitrate', '2000')}kbps"}
+            return {"url": url, "filename": f"{title}.flac", "filename_title": str(item.get("song") or title).strip(), "size": size_bytes(item.get("size", "")), "source": "酷我", "quality": f"FLAC {item.get('bitrate', '2000')}kbps"}
     return None
 
 
@@ -482,7 +483,7 @@ def netease_search(title, artist):
             size = int(probe.headers.get("content-length", 0) or 0)
             probe.close()
             if is_flac:
-                return {"url": download_url, "filename": f"{title}.flac", "size": size, "source": "网易云", "quality": "FLAC"}
+                return {"url": download_url, "filename": f"{title}.flac", "filename_title": str(row_title).strip(), "size": size, "source": "网易云", "quality": "FLAC"}
         except Exception:
             pass
     return None
@@ -755,7 +756,8 @@ def main():
         artist_folder = safe_name(artist_folder_name(found["artist"]))
         ensure_webdav_folder(auth, artist_folder)
         log(f"[{index}/{len(songs)}] 目标文件夹：{artist_folder}")
-        base_filename = safe_name(f"{original['title']} - {original['artist']}.flac")
+        filename_title = safe_name(str(found.get("filename_title") or original["title"]).strip())
+        base_filename = safe_name(f"{filename_title} - {original['artist']}.flac")
         local = work / base_filename
         try:
             r = requests.get(found["url"], headers=SOURCE_HEADERS, stream=True, timeout=300)
