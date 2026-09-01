@@ -9,9 +9,15 @@ import sys
 import time
 import unicodedata
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, parse_qs, urlparse
 
 import requests
+
+try:
+    from mutagen.flac import FLAC, Picture
+except ImportError:
+    FLAC = None
+    Picture = None
 
 try:
     from opencc import OpenCC
@@ -19,6 +25,7 @@ try:
 except ImportError:
     TRAD_TO_SIMP = None
 
+NETEASE_BASE = "https://api.qijieya.cn"
 try:
     import syy  # syy.py must be in the repository root
     QQ_API = syy.TANG_API
@@ -27,7 +34,7 @@ try:
 except ImportError:
     QQ_API = "https://tang.api.s01s.cn/music_open_api.php"
     KUWO_API = "https://oiapi.net/api/Kuwo"
-    NETEASE_API = "https://api.qijieya.cn/meting/"
+    NETEASE_API = f"{NETEASE_BASE}/meting/"
 
 MB_API = "https://musicbrainz.org/ws/2"
 MB_HEADERS = {"User-Agent": "music-download-action/1.0 (n8n workflow)"}
@@ -418,38 +425,64 @@ def recursive_flac(value):
 
 
 def kuwo_search(title, artist):
-    data = request_json(KUWO_API, {"msg": f"{title} {artist}", "page": 1, "limit": 20}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=1)
-    for row in (data.get("data", [])[:3] if isinstance(data, dict) else []):
-        if not isinstance(row, dict) or not row.get("rid"):
+    # 酷我 HAR：先搜索，再用 msg+n+br=1 获取真实无损地址。
+    query = f"{title} {artist}"
+    data = request_json(KUWO_API, {"msg": query, "page": 1, "limit": 10}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=1)
+    rows = data.get("data", []) if isinstance(data, dict) else []
+    if not isinstance(rows, list):
+        return None
+
+    def size_bytes(value):
+        match = re.search(r"([0-9]+(?:\\.[0-9]+)?)\\s*(Mi?B|Gi?B|Ki?B|B)", str(value), re.I)
+        if not match:
+            return 0
+        number, unit = float(match.group(1)), match.group(2).lower()
+        factor = {"b": 1, "kib": 1024, "kb": 1024, "mib": 1024**2, "mb": 1024**2, "gib": 1024**3, "gb": 1024**3}[unit]
+        return int(number * factor)
+
+    for index, row in enumerate(rows, 1):
+        if not isinstance(row, dict):
             continue
-        for params in ({"rid": row["rid"]}, {"msg": row["rid"]}):
-            try:
-                detail = request_json(KUWO_API, params, SOURCE_HEADERS, timeout=DETAIL_TIMEOUT, retries=1)
-                url = recursive_flac(detail)
-                if url:
-                    size = 0
-                    head = requests.head(url, headers=SOURCE_HEADERS, timeout=30, allow_redirects=True)
-                    if head.headers.get("content-length"):
-                        size = int(head.headers["content-length"])
-                    return {"url": url, "filename": f"{title}.flac", "size": size, "source": "酷我", "quality": "FLAC"}
-            except Exception:
-                pass
+        if canonical_title(row.get("song", "")) != canonical_title(title):
+            continue
+        if canonical_artist(row.get("singer", "")) != canonical_artist(artist):
+            continue
+        types = row.get("types", [])
+        has_flac = isinstance(types, list) and any(
+            isinstance(t, dict) and str(t.get("format", "")).lower() == "flac"
+            for t in types
+        )
+        if not has_flac:
+            continue
+        detail = request_json(KUWO_API, {"msg": query, "n": index, "br": 1}, SOURCE_HEADERS, timeout=DETAIL_TIMEOUT, retries=1)
+        item = detail.get("data", {}) if isinstance(detail, dict) else {}
+        url = item.get("url") if isinstance(item, dict) else ""
+        fmt = str(item.get("format", "")).lower() if isinstance(item, dict) else ""
+        if url and fmt == "flac" and str(url).lower().split("?")[0].endswith(".flac"):
+            return {"url": url, "filename": f"{title}.flac", "size": size_bytes(item.get("size", "")), "source": "酷我", "quality": f"FLAC {item.get('bitrate', '2000')}kbps"}
     return None
 
 
 def netease_search(title, artist):
     data = request_json(NETEASE_API, {"type": "search", "id": f"{title} {artist}", "limit": 10, "page": 1, "server": "netease"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=1)
     for row in (data if isinstance(data, list) else []):
-        url = row.get("url") if isinstance(row, dict) else None
-        if not url:
+        row_title, row_artist = row.get("name", ""), row.get("artist", "")
+        if canonical_title(row_title) != canonical_title(title) or canonical_artist(row_artist) != canonical_artist(artist):
             continue
+        search_url = row.get("url", "")
+        song_id = parse_qs(urlparse(search_url).query).get("id", [""])[0]
+        if not song_id:
+            continue
+        # 搜索和下载接口分开：明确请求网易云无损档位 br=2000。
+        download_url = f"{NETEASE_API}?server=netease&type=url&id={song_id}&br=2000"
         try:
-            r = requests.get(url, headers=SOURCE_HEADERS, timeout=60, allow_redirects=True)
-            r.raise_for_status()
-            real = r.text.strip()
-            if ".flac" in real.lower():
-                size = int(r.headers.get("content-length", 0) or 0)
-                return {"url": real, "filename": f"{title}.flac", "size": size, "source": "网易云", "quality": "FLAC"}
+            probe = requests.get(download_url, headers=SOURCE_HEADERS, timeout=60, allow_redirects=True, stream=True)
+            content_type = probe.headers.get("content-type", "").lower()
+            is_flac = ".flac" in probe.url.lower() or "audio/flac" in content_type or "audio/x-flac" in content_type
+            size = int(probe.headers.get("content-length", 0) or 0)
+            probe.close()
+            if is_flac:
+                return {"url": download_url, "filename": f"{title}.flac", "size": size, "source": "网易云", "quality": "FLAC"}
         except Exception:
             pass
     return None
@@ -466,10 +499,101 @@ def find_source(song):
             log(f"{func.__name__} 搜索失败：{exc}")
     if not found:
         return None
-    # 只选一首：SQ 优先，其次其他真实 FLAC；同质量按 QQ→酷我→网易云。
-    quality_rank = {"SQ": 3, "FLAC": 2, "PQ": 1}
-    source_rank = {"QQ": 3, "酷我": 2, "网易云": 1}
-    return max(found, key=lambda x: (quality_rank.get(x.get("quality"), 0), source_rank.get(x.get("source"), 0)))
+    # 下载源严格按 QQ → 网易云 → 酷我；每个源内部已优先选择自身最高 FLAC 档位。
+    source_priority = {"QQ": 0, "网易云": 1, "酷我": 2}
+    return min(found, key=lambda x: source_priority.get(x.get("source"), 99))
+
+
+def netease_metadata(title, artist):
+    """按网易云 HAR 的 Meting 兼容接口获取封面和歌词。"""
+    try:
+        rows = request_json(NETEASE_API, {"type": "search", "id": f"{title} {artist}", "limit": 10, "page": 1, "server": "netease"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=1)
+        for row in rows if isinstance(rows, list) else []:
+            row_title, row_artist = row.get("name", ""), row.get("artist", "")
+            if canonical_title(row_title) != canonical_title(title) or canonical_artist(row_artist) != canonical_artist(artist):
+                continue
+            cover_url, lyric_url = row.get("pic", ""), row.get("lrc", "")
+            album = row.get("album", "") or ""
+            lyric = requests.get(lyric_url, headers=SOURCE_HEADERS, timeout=DETAIL_TIMEOUT) if lyric_url else None
+            lyrics = lyric.text.strip() if lyric.ok else ""
+            return {"album": str(album), "cover_url": cover_url, "lyrics": lyrics}
+    except Exception as exc:
+        log(f"网易云元数据获取失败，准备回退：{exc}")
+    return {}
+
+
+def embed_metadata(local_path, song):
+    """将歌曲信息、歌词和封面写入 FLAC；元数据失败不影响上传。"""
+    if FLAC is None:
+        log("未安装 mutagen，跳过歌曲元数据封装")
+        return
+    try:
+        audio = FLAC(str(local_path))
+        title, artist = song.get("title", ""), song.get("artist", "")
+        audio["title"] = [title]
+        audio["artist"] = [artist]
+        if song.get("album"):
+            audio["album"] = [song["album"]]
+        audio["comment"] = [f"Source: {song.get('source', '')}; Quality: {song.get('quality', '')}"]
+
+        # 网易云优先提供封面、歌词和专辑信息。
+        netease = netease_metadata(title, artist)
+        if netease.get("album") and not song.get("album"):
+            audio["album"] = [netease["album"]]
+        if netease.get("lyrics"):
+            audio["lyrics"] = [netease["lyrics"]]
+        if netease.get("cover_url"):
+            try:
+                cover = requests.get(netease["cover_url"], headers=SOURCE_HEADERS, timeout=30)
+                cover.raise_for_status()
+                picture = Picture()
+                picture.type = 3
+                picture.mime = cover.headers.get("Content-Type", "image/jpeg").split(";")[0]
+                picture.desc = "Cover"
+                picture.data = cover.content
+                audio.clear_pictures()
+                audio.add_picture(picture)
+            except Exception as exc:
+                log(f"网易云封面下载失败，继续回退：{exc}")
+
+        # 网易云无结果时，Last.fm 提供封面和专辑信息；没有 API key 时安全跳过。
+        info = {}
+        if os.getenv("LASTFM_API_KEY"):
+            try:
+                info = lastfm_get("track.getInfo", {"artist": artist, "track": title, "autocorrect": 1}).get("track", {})
+                album = info.get("album") or {}
+                album_name = album.get("title")
+                if album_name and not song.get("album") and not netease.get("album"):
+                    audio["album"] = [album_name]
+                images = album.get("image") or []
+                cover_url = next((x.get("#text") for x in reversed(images) if x.get("#text")), "")
+                if cover_url and not netease.get("cover_url"):
+                    cover = requests.get(cover_url, timeout=30)
+                    cover.raise_for_status()
+                    picture = Picture()
+                    picture.type = 3
+                    picture.mime = cover.headers.get("Content-Type", "image/jpeg").split(";")[0]
+                    picture.desc = "Cover"
+                    picture.data = cover.content
+                    audio.clear_pictures()
+                    audio.add_picture(picture)
+            except Exception as exc:
+                log(f"封面/专辑信息获取失败，继续封装其它信息：{exc}")
+
+        # LRCLIB 无需密钥；优先写同步歌词，找不到则写纯文本歌词。
+        try:
+            lyric = requests.get("https://lrclib.net/api/get", params={"track_name": title, "artist_name": artist}, timeout=30)
+            if lyric.status_code == 200:
+                lyric_data = lyric.json()
+                lyrics = lyric_data.get("syncedLyrics") or lyric_data.get("plainLyrics")
+                if lyrics and not netease.get("lyrics"):
+                    audio["lyrics"] = [lyrics]
+        except Exception as exc:
+            log(f"歌词获取失败，继续上传：{exc}")
+        audio.save()
+        log(f"元数据封装完成：{title} - {artist}")
+    except Exception as exc:
+        log(f"FLAC 元数据封装失败，继续上传原文件：{exc}")
 
 
 def safe_name(value):
@@ -650,6 +774,8 @@ def main():
             log(f"[{index}/{len(songs)}] 下载完成：{actual / 1048576:.2f} MiB，检查 WebDAV 文件")
             if found["size"] and abs(actual - found["size"]) > SIZE_TOLERANCE:
                 raise RuntimeError(f"体积异常 {actual}/{found['size']}")
+            embed_metadata(local, found)
+            actual = local.stat().st_size
             filename = choose_filename(auth, base_filename, actual, subfolder=artist_folder)
             if filename is None:
                 local.unlink(missing_ok=True)

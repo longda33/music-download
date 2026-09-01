@@ -792,57 +792,40 @@ def search_kuwo(singer):
 # ============================================================
 
 def kuwo_get_url(song):
-
-    """
-    OIAPI 搜索结果已经明确告诉我们
-    该歌曲有没有 FLAC。
-
-    但搜索 JSON 本身没有直接给音频 URL，
-    所以尝试使用 OIAPI 的单曲查询方式。
-
-    如果接口不支持，则记录失败，
-    不把 MP3 改成 FLAC。
-    """
-
-    rid = song["source_id"]
-
-    # 常见 OIAPI 单曲参数
-    candidate_params = [
-        {
-            "rid": rid
-        },
-        {
-            "msg": rid
-        },
-    ]
-
-    for params in candidate_params:
-
-        try:
-
-            data = get_json(
+    """按酷我 HAR 使用 msg+n+br=1 获取真实 FLAC 地址。"""
+    title = song.get("title", "")
+    artist = song.get("artist", "")
+    query = f"{title} {artist}"
+    try:
+        data = get_json(
+            KUWO_API,
+            params={"msg": query, "page": 1, "limit": KUWO_LIMIT},
+            description=f"酷我搜索 {query}"
+        )
+        rows = data.get("data", []) if isinstance(data, dict) else []
+        if not isinstance(rows, list):
+            return None
+        for index, row in enumerate(rows, 1):
+            if not isinstance(row, dict):
+                continue
+            if normalize_text(row.get("song", "")) != normalize_text(title):
+                continue
+            if normalize_text(row.get("singer", "")) != normalize_text(artist):
+                continue
+            types = row.get("types", [])
+            if not isinstance(types, list) or not any(str(t.get("format", "")).lower() == "flac" for t in types if isinstance(t, dict)):
+                continue
+            detail = get_json(
                 KUWO_API,
-                params=params,
-                description=f"酷我单曲 {rid}"
+                params={"msg": query, "n": index, "br": 1},
+                description=f"酷我 FLAC 地址 {title}"
             )
-
-            # ------------------------------------------------
-            # 尝试递归寻找 FLAC URL
-            # ------------------------------------------------
-
-            result = find_flac_url(data)
-
-            if result:
-                return result
-
-        except Exception as e:
-
-            logger.warning(
-                "酷我单曲接口尝试失败 %s：%s",
-                params,
-                e
-            )
-
+            item = detail.get("data", {}) if isinstance(detail, dict) else {}
+            url = item.get("url") if isinstance(item, dict) else None
+            if url and str(item.get("format", "")).lower() == "flac" and str(url).lower().split("?")[0].endswith(".flac"):
+                return url
+    except Exception as e:
+        logger.warning("酷我获取 FLAC 地址失败 %s：%s", title, e)
     return None
 
 
@@ -902,14 +885,10 @@ def merge_songs(
 
     all_songs = []
 
-    # 优先级：
-    # Tang > Kuwo > Netease
-    #
-    # 因为 Tang 接口明确返回 SQ/PQ FLAC 下载地址。
-
+    # 下载优先级：QQ → 网易云 → 酷我
     all_songs.extend(tang)
-    all_songs.extend(kuwo)
     all_songs.extend(netease)
+    all_songs.extend(kuwo)
 
     result = []
 
