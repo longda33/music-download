@@ -494,7 +494,8 @@ def find_source(song):
         try:
             item = func(song["title"], song["artist"])
             if item:
-                found.append({**song, **item})
+                # 保留目录发现阶段的原始标题/歌手，音源只补充下载字段。
+                found.append({**item, **song})
         except Exception as exc:
             log(f"{func.__name__} 搜索失败：{exc}")
     if not found:
@@ -754,7 +755,7 @@ def main():
         artist_folder = safe_name(artist_folder_name(found["artist"]))
         ensure_webdav_folder(auth, artist_folder)
         log(f"[{index}/{len(songs)}] 目标文件夹：{artist_folder}")
-        base_filename = safe_name(f"{found['title']} - {found['artist']}.flac")
+        base_filename = safe_name(f"{original['title']} - {original['artist']}.flac")
         local = work / base_filename
         try:
             r = requests.get(found["url"], headers=SOURCE_HEADERS, stream=True, timeout=300)
