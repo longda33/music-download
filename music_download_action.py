@@ -548,6 +548,9 @@ def embed_metadata(local_path, song):
     title, artist = song.get("title", ""), song.get("artist", "")
     try:
         audio = FLAC(str(local_path))
+        # 下载源返回的原始歌曲名优先，保留 (Live)、现场版等版本标识。
+        title = str(song.get("filename_title") or song.get("title", "")).strip()
+        artist = str(song.get("artist", "")).strip()
         audio["title"] = [title]
         audio["artist"] = [artist]
         if song.get("album"):
