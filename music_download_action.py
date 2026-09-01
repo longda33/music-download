@@ -507,18 +507,35 @@ def find_source(song):
 
 
 def netease_metadata(title, artist):
-    """按网易云 HAR 的 Meting 兼容接口获取封面和歌词。"""
+    """网易云元数据独立于音频格式；即使播放地址是 MP3，也读取歌词和封面。"""
     try:
-        rows = request_json(NETEASE_API, {"type": "search", "id": f"{title} {artist}", "limit": 10, "page": 1, "server": "netease"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=1)
+        rows = request_json(
+            NETEASE_API,
+            {"type": "search", "id": f"{title} {artist}", "limit": 30, "page": 1, "server": "netease"},
+            SOURCE_HEADERS,
+            timeout=SOURCE_TIMEOUT,
+            retries=1,
+        )
         for row in rows if isinstance(rows, list) else []:
-            row_title, row_artist = row.get("name", ""), row.get("artist", "")
-            if canonical_title(row_title) != canonical_title(title) or canonical_artist(row_artist) != canonical_artist(artist):
+            row_title = str(row.get("name") or "").strip()
+            row_artist = str(row.get("artist") or "").strip()
+            if canonical_title(row_title) != canonical_title(title):
                 continue
-            cover_url, lyric_url = row.get("pic", ""), row.get("lrc", "")
-            album = row.get("album", "") or ""
-            lyric = requests.get(lyric_url, headers=SOURCE_HEADERS, timeout=DETAIL_TIMEOUT) if lyric_url else None
-            lyrics = lyric.text.strip() if lyric.ok else ""
-            return {"album": str(album), "cover_url": cover_url, "lyrics": lyrics}
+            if canonical_artist(row_artist) != canonical_artist(artist):
+                continue
+
+            # search 返回的 pic/lrc 已经是 Meting 独立元数据接口，
+            # 不检查 type=url 的音频格式，避免 MP3 音频导致元数据丢失。
+            cover_url = str(row.get("pic") or "").strip()
+            lyric_url = str(row.get("lrc") or "").strip()
+            lyrics = ""
+            if lyric_url:
+                lyric = requests.get(lyric_url, headers=SOURCE_HEADERS, timeout=DETAIL_TIMEOUT)
+                if lyric.ok:
+                    lyrics = lyric.text.strip()
+            log(f"网易云歌曲信息已找到：{row_title} - {row_artist}（歌词={'有' if lyrics else '无'}，封面={'有' if cover_url else '无'}）")
+            return {"album": str(row.get("album") or ""), "cover_url": cover_url, "lyrics": lyrics}
+        log(f"网易云未匹配到歌曲信息：{title} - {artist}")
     except Exception as exc:
         log(f"网易云元数据获取失败，准备回退：{exc}")
     return {}
