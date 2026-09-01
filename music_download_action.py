@@ -215,6 +215,20 @@ def platform_discover(query):
     return candidates
 
 
+def exact_pair_match(song, query):
+    """校验双项命令，防止模糊搜索把相似歌名当成目标歌曲。"""
+    parts = query.split()
+    if len(parts) < 2:
+        return True
+    title = canonical_title(song.get("title", ""))
+    artist = canonical_artist(song.get("artist", ""))
+    for cut in range(1, len(parts)):
+        left, right = " ".join(parts[:cut]), " ".join(parts[cut:])
+        if (title == canonical_title(left) and artist == canonical_artist(right)) or (title == canonical_title(right) and artist == canonical_artist(left)):
+            return True
+    return False
+
+
 def discover_songs(mode, query):
     songs = []
     if mode == "search":
@@ -324,6 +338,8 @@ def discover_songs(mode, query):
     seen = set()
     result = []
     for song in songs:
+        if mode == "search" and not exact_pair_match(song, query):
+            continue
         artists = [{"artist": {"name": name.strip()}} for name in song["artist"].split(" & ") if name.strip()]
         if not song["title"] or not one_artist(artists):
             continue
