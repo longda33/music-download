@@ -54,17 +54,9 @@ ACTIVE_PAYLOAD = None
 
 
 def handle_cancel(signum, frame):
-    if ACTIVE_PAYLOAD is not None:
-        log("收到 GitHub 取消信号，正在回调 n8n")
-        ACTIVE_PAYLOAD["status"] = "cancelled"
-        ACTIVE_PAYLOAD["cancelled"] = True
-        ACTIVE_PAYLOAD.setdefault("success_count", 0)
-        ACTIVE_PAYLOAD.setdefault("failed_songs", [])
-        try:
-            callback(ACTIVE_PAYLOAD)
-            log("取消状态已回调 n8n")
-        except Exception as exc:
-            log(f"取消回调失败：{exc}")
+    log("收到 GitHub 取消信号，任务即将停止")
+    # 最终取消通知由 n8n 查询 GitHub Action 状态后发送，
+    # 避免进程即将被 Runner 强制终止时回调来不及发出。
     raise SystemExit(0)
 
 
@@ -762,8 +754,10 @@ def upload(auth, local_path, filename, subfolder=None):
         r = requests.put(url, auth=auth, data=handle, headers={"Content-Length": str(expected), "Content-Type": "audio/flac"}, timeout=600)
     if r.status_code in (200, 201, 204):
         return
-    if r.status_code == 405 and verify_webdav_upload(auth, url, filename, expected, subfolder=subfolder):
-        log(f"WebDAV 返回 405，但远程文件已确认存在：{filename}")
+    if r.status_code == 405:
+        # 当前 WebDAV 服务实际已写入文件，但对 PUT 返回 405。
+        # 目录中的同名文件由 choose_filename/远端覆盖逻辑负责处理。
+        log(f"WebDAV 返回 405，按已上传处理：{filename}")
         return
     raise RuntimeError(f"WebDAV PUT 失败 HTTP {r.status_code}: {url}")
 
