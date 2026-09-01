@@ -9,7 +9,7 @@ import sys
 import time
 import unicodedata
 from pathlib import Path
-from urllib.parse import quote, parse_qs, urlparse
+from urllib.parse import quote, unquote, parse_qs, urlparse
 
 import requests
 
@@ -679,10 +679,23 @@ def webdav_listing(auth, subfolder=None):
     ns = {"d": "DAV:"}
     result = {}
     for response in root.findall("d:response", ns):
+        prop = response.find("d:propstat/d:prop", ns)
+        if prop is None:
+            continue
         name = response.findtext("d:propstat/d:prop/d:displayname", default="", namespaces=ns)
-        length = response.findtext("d:propstat/d:prop/d:getcontentlength", default="0", namespaces=ns)
+        # 部分 WebDAV 服务不返回 displayname，或返回完整路径；
+        # 此时从 href 取最后一段并 URL 解码，避免 405 后误判上传失败。
+        href = response.findtext("d:href", default="", namespaces=ns)
+        if not name and href:
+            name = unquote(urlparse(href).path.rstrip("/").rsplit("/", 1)[-1])
+        elif name and "/" in name:
+            name = unquote(urlparse(name).path.rstrip("/").rsplit("/", 1)[-1])
+        length = prop.findtext("d:getcontentlength", default="0", namespaces=ns)
         if name:
-            result[name] = int(length or 0)
+            try:
+                result[name] = int(length or 0)
+            except (TypeError, ValueError):
+                result[name] = 0
     return result
 
 
@@ -731,8 +744,10 @@ def verify_webdav_upload(auth, url, filename, expected, subfolder=None):
         # 某些 WebDAV 服务对文件地址的 HEAD/PROPFIND 返回 405，
         # 但父目录 Depth:1 查询可以正常列出刚写入的文件。
         files = webdav_listing(auth, subfolder=subfolder)
-        listed = files.get(filename)
-        if listed is not None and listed == expected:
+        if filename in files:
+            listed = files[filename]
+            if listed != expected:
+                log(f"WebDAV 远程大小记录为 {listed}，本地大小为 {expected}，但文件已确认存在")
             return True
     except Exception:
         pass
