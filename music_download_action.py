@@ -782,6 +782,7 @@ def callback(payload):
         "cancelled": payload.get("cancelled", False),
         "success_count": payload.get("success_count", 0),
         "failed_songs": payload.get("failed_songs", []),
+        "error": payload.get("error", ""),
     }
     requests.post(url, headers=headers, json=result, timeout=30).raise_for_status()
 
@@ -874,5 +875,17 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        message = str(exc)
+        print(f"ERROR: {message}", file=sys.stderr, flush=True)
+        if ACTIVE_PAYLOAD is not None:
+            ACTIVE_PAYLOAD["status"] = "failed"
+            ACTIVE_PAYLOAD["cancelled"] = False
+            ACTIVE_PAYLOAD["error"] = message
+            ACTIVE_PAYLOAD.setdefault("success_count", 0)
+            ACTIVE_PAYLOAD.setdefault("failed_songs", [])
+            try:
+                callback(ACTIVE_PAYLOAD)
+                log("异常状态已回调 n8n")
+            except Exception as callback_exc:
+                print(f"ERROR: 异常回调失败：{callback_exc}", file=sys.stderr, flush=True)
         sys.exit(1)
