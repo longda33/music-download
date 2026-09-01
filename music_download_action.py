@@ -590,13 +590,26 @@ def embed_metadata(local_path, song):
                 if album_name and not song.get("album") and not netease.get("album"):
                     audio["album"] = [album_name]
                 images = album.get("image") or []
-                cover_url = next((x.get("#text") for x in reversed(images) if x.get("#text")), "")
-                if cover_url and not netease.get("cover_url"):
-                    cover = requests.get(cover_url, timeout=30)
-                    if cover.status_code == 404:
-                        log("Last.fm 封面地址已失效，跳过封面；专辑信息继续使用")
+                # Last.fm 可能只让某一个尺寸的 CDN 地址失效；
+                # 按大图到小图依次尝试，成功一个即可写入封面。
+                cover_urls = []
+                for image in reversed(images):
+                    image_url = str(image.get("#text") or "").strip() if isinstance(image, dict) else ""
+                    if image_url and image_url not in cover_urls:
+                        cover_urls.append(image_url)
+                if cover_urls and not netease.get("cover_url"):
+                    cover = None
+                    for cover_url in cover_urls:
+                        candidate = requests.get(cover_url, headers=SOURCE_HEADERS, timeout=30)
+                        if candidate.status_code == 404:
+                            continue
+                        candidate.raise_for_status()
+                        if candidate.content:
+                            cover = candidate
+                            break
+                    if cover is None:
+                        log("Last.fm 封面地址均不可用，跳过封面；专辑信息继续使用")
                     else:
-                        cover.raise_for_status()
                         picture = Picture()
                         picture.type = 3
                         picture.mime = cover.headers.get("Content-Type", "image/jpeg").split(";")[0]
