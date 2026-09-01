@@ -34,7 +34,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: python -m pip install --upgrade requests tqdm
+        run: python -m pip install --upgrade requests tqdm opencc-python-reimplemented
 
       - name: Run music downloader
         env:
