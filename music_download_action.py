@@ -593,14 +593,17 @@ def embed_metadata(local_path, song):
                 cover_url = next((x.get("#text") for x in reversed(images) if x.get("#text")), "")
                 if cover_url and not netease.get("cover_url"):
                     cover = requests.get(cover_url, timeout=30)
-                    cover.raise_for_status()
-                    picture = Picture()
-                    picture.type = 3
-                    picture.mime = cover.headers.get("Content-Type", "image/jpeg").split(";")[0]
-                    picture.desc = "Cover"
-                    picture.data = cover.content
-                    audio.clear_pictures()
-                    audio.add_picture(picture)
+                    if cover.status_code == 404:
+                        log("Last.fm 封面地址已失效，跳过封面；专辑信息继续使用")
+                    else:
+                        cover.raise_for_status()
+                        picture = Picture()
+                        picture.type = 3
+                        picture.mime = cover.headers.get("Content-Type", "image/jpeg").split(";")[0]
+                        picture.desc = "Cover"
+                        picture.data = cover.content
+                        audio.clear_pictures()
+                        audio.add_picture(picture)
             except Exception as exc:
                 log(f"Last.fm 封面/专辑信息获取失败：{exc}")
 
