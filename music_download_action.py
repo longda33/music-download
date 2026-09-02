@@ -556,35 +556,56 @@ def find_source(song):
 
 
 def netease_metadata(title, artist):
-    """网易云元数据独立于音频格式；即使播放地址是 MP3，也读取歌词和封面。"""
+    """网易云元数据独立于音频格式；先歌手精确匹配，失败时安全回退到唯一歌曲名。"""
     try:
-        rows = request_json(
-            NETEASE_API,
-            {"type": "search", "id": f"{title} {artist}", "limit": 30, "page": 1, "server": "netease"},
-            SOURCE_HEADERS,
-            timeout=SOURCE_TIMEOUT,
-            retries=1,
-        )
-        for row in rows if isinstance(rows, list) else []:
-            row_title = str(row.get("name") or "").strip()
-            row_artist = str(row.get("artist") or "").strip()
-            if canonical_title(row_title) != canonical_title(title):
+        title_rows = []
+        seen_urls = set()
+        for search_text in (f"{title} {artist}", title):
+            rows = request_json(
+                NETEASE_API,
+                {"type": "search", "id": search_text, "limit": 30, "page": 1, "server": "netease"},
+                SOURCE_HEADERS,
+                timeout=SOURCE_TIMEOUT,
+                retries=1,
+            )
+            for row in rows if isinstance(rows, list) else []:
+                row_title = str(row.get("name") or "").strip()
+                row_artist = str(row.get("artist") or "").strip()
+                if canonical_title(row_title) != canonical_title(title):
+                    continue
+                row_key = str(row.get("url") or row.get("lrc") or f"{row_title}|{row_artist}")
+                if row_key in seen_urls:
+                    continue
+                seen_urls.add(row_key)
+                title_rows.append(row)
+                if canonical_artist(row_artist) == canonical_artist(artist):
+                    selected = row
+                    break
+            else:
                 continue
-            if canonical_artist(row_artist) != canonical_artist(artist):
-                continue
+            if canonical_artist(str(selected.get("artist") or "")) == canonical_artist(artist):
+                break
+        else:
+            selected = None
 
-            # search 返回的 pic/lrc 已经是 Meting 独立元数据接口，
-            # 不检查 type=url 的音频格式，避免 MP3 音频导致元数据丢失。
-            cover_url = str(row.get("pic") or "").strip()
-            lyric_url = str(row.get("lrc") or "").strip()
-            lyrics = ""
-            if lyric_url:
-                lyric = requests.get(lyric_url, headers=SOURCE_HEADERS, timeout=DETAIL_TIMEOUT)
-                if lyric.ok:
-                    lyrics = simplify_chinese_lyrics(lyric.text, title, artist)
-            log(f"网易云歌曲信息已找到：{row_title} - {row_artist}（歌词={'有' if lyrics else '无'}，封面={'有' if cover_url else '无'}）")
-            return {"album": str(row.get("album") or ""), "cover_url": cover_url, "lyrics": lyrics}
-        log(f"网易云未匹配到歌曲信息：{title} - {artist}")
+        if 'selected' not in locals() or selected is None:
+            selected = title_rows[0] if len(title_rows) == 1 else None
+        if selected is None:
+            log(f"网易云未匹配到歌曲信息：{title} - {artist}")
+            return {}
+
+        row_title = str(selected.get("name") or "").strip()
+        row_artist = str(selected.get("artist") or "").strip()
+        cover_url = str(selected.get("pic") or "").strip()
+        lyric_url = str(selected.get("lrc") or "").strip()
+        lyrics = ""
+        if lyric_url:
+            lyric = requests.get(lyric_url, headers=SOURCE_HEADERS, timeout=DETAIL_TIMEOUT)
+            if lyric.ok:
+                lyrics = simplify_chinese_lyrics(lyric.text, title, artist)
+        suffix = "歌手精确匹配" if canonical_artist(row_artist) == canonical_artist(artist) else "歌曲名唯一匹配"
+        log(f"网易云歌曲信息已找到：{row_title} - {row_artist}（{suffix}，歌词={'有' if lyrics else '无'}，封面={'有' if cover_url else '无'}）")
+        return {"album": str(selected.get("album") or ""), "cover_url": cover_url, "lyrics": lyrics}
     except Exception as exc:
         log(f"网易云元数据获取失败，准备回退：{exc}")
     return {}
@@ -661,7 +682,10 @@ def embed_metadata(local_path, song):
                         audio.clear_pictures()
                         audio.add_picture(picture)
             except Exception as exc:
-                log(f"Last.fm 封面/专辑信息获取失败：{exc}")
+                if "Last.fm API 错误 6" in str(exc):
+                    log(f"Last.fm 未找到歌曲信息：{title} - {artist}")
+                else:
+                    log(f"Last.fm 封面/专辑信息获取失败：{exc}")
 
         # LRCLIB 作为网易云无歌词时的补充。
         if not netease.get("lyrics"):
