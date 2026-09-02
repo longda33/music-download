@@ -194,7 +194,7 @@ def canonical_artist(value):
         return direct
     # 将“等什么君(邓寓君)”“邓寓君（等什么君）”等写法拆成别名片段；
     # 只要所有片段指向同一规范艺人，就统一使用同一个身份和文件夹。
-    fragments = re.split(r"[\\s&+/、,，;；()（）\\[\\]【】]+", raw)
+    fragments = re.split(r"[\s&+/、,，;；()（）\[\]【】]+", raw)
     mapped = [ARTIST_ALIASES.get(fragment, ARTIST_ALIASES.get(dedup_key(fragment)))
               for fragment in fragments if fragment]
     mapped = [item for item in mapped if item]
@@ -911,13 +911,13 @@ def main():
                 raise RuntimeError(f"体积异常 {actual}/{found['size']}")
             embed_metadata(local, found)
             actual = local.stat().st_size
-            filename = choose_filename(auth, base_filename, actual, subfolder=artist_folder)
+            filename = choose_filename(auth, base_filename, actual, subfolder=target_folder)
             if filename is None:
                 local.unlink(missing_ok=True)
                 skipped += 1
                 log(f"[{index}/{len(songs)}] 跳过：WebDAV 已存在相同文件")
                 continue
-            upload(auth, local, filename, subfolder=artist_folder)
+            upload(auth, local, filename, subfolder=target_folder)
             local.unlink(missing_ok=True)
             success += 1
             log(f"[{index}/{len(songs)}] 上传完成：{filename}")
