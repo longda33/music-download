@@ -402,8 +402,18 @@ def discover_songs(mode, query):
     seen = set()
     result = []
     for song in songs:
-        if mode == "search" and not exact_pair_match(song, query):
-            continue
+        if mode == "search":
+            parts = query.split()
+            if len(parts) >= 2:
+                if not exact_pair_match(song, query):
+                    continue
+            else:
+                # 单项搜索必须是歌曲名或歌手名完全匹配；
+                # 禁止“寂寞沙洲”匹配到“寂寞沙洲冷”等相似标题。
+                title_match = canonical_title(song.get("title", "")) == canonical_title(query)
+                artist_match = canonical_artist(song.get("artist", "")) == canonical_artist(query)
+                if not (title_match or artist_match):
+                    continue
         artists = [{"artist": {"name": name.strip()}} for name in song["artist"].split(" & ") if name.strip()]
         if not song["title"] or not one_artist(artists):
             continue
@@ -847,7 +857,7 @@ def main():
     log(f"目录检索完成：共 {len(songs)} 首，三人及以上合唱已过滤")
     auth = webdav_auth()
     ensure_webdav_folder(auth)
-    log("WebDAV 连接正常，开始逐首处理；文件将保存到歌手名文件夹")
+    log("WebDAV 连接正常，开始逐首处理；单项歌曲名搜索保存到歌曲名文件夹，歌手搜索保存到歌手文件夹")
     work = Path("downloaded_music")
     work.mkdir(exist_ok=True)
     success = 0
