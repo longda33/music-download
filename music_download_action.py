@@ -143,11 +143,19 @@ ARTIST_ALIASES = {
     "赵露思 (rosy)": "zhaolusi",
     "赵露思(rosy)": "zhaolusi",
     "赵露思（rosy）": "zhaolusi",
+    "等什么君": "dengshimeijun",
+    "邓寓君": "dengshimeijun",
+    "dengshimeijun": "dengshimeijun",
+    "等什么君(邓寓君)": "dengshimeijun",
+    "等什么君（邓寓君）": "dengshimeijun",
+    "邓寓君(等什么君)": "dengshimeijun",
+    "邓寓君（等什么君）": "dengshimeijun",
 }
 
 ARTIST_FOLDER_NAMES = {
     "jolintsai": "蔡依林",
     "zhaolusi": "赵露思",
+    "dengshimeijun": "等什么君",
 }
 
 
@@ -181,7 +189,18 @@ def simplify_chinese_lyrics(lyrics, title, artist):
 def canonical_artist(value):
     raw = unicodedata.normalize("NFKC", to_simplified(value)).strip().casefold()
     compact = dedup_key(raw)
-    return ARTIST_ALIASES.get(raw, ARTIST_ALIASES.get(compact, compact))
+    direct = ARTIST_ALIASES.get(raw, ARTIST_ALIASES.get(compact))
+    if direct:
+        return direct
+    # 将“等什么君(邓寓君)”“邓寓君（等什么君）”等写法拆成别名片段；
+    # 只要所有片段指向同一规范艺人，就统一使用同一个身份和文件夹。
+    fragments = re.split(r"[\\s&+/、,，;；()（）\\[\\]【】]+", raw)
+    mapped = [ARTIST_ALIASES.get(fragment, ARTIST_ALIASES.get(dedup_key(fragment)))
+              for fragment in fragments if fragment]
+    mapped = [item for item in mapped if item]
+    if mapped and len(set(mapped)) == 1:
+        return mapped[0]
+    return compact
 
 
 def canonical_title(value):
@@ -749,6 +768,16 @@ def verify_webdav_upload(auth, url, filename, expected, subfolder=None):
     if actual is not None and actual == expected:
         return True
     try:
+        # AList 某些驱动上传成功后，文件地址的 HEAD/PROPFIND 可能异常；
+        # 用 Range GET 验证目标文件可读取，避免把已上传文件误报为失败。
+        probe = requests.get(url, auth=auth, headers={"Range": "bytes=0-0"}, stream=True, timeout=30, allow_redirects=True)
+        exists = probe.status_code in (200, 206)
+        probe.close()
+        if exists:
+            return True
+    except Exception:
+        pass
+    try:
         # 某些 WebDAV 服务对文件地址的 HEAD/PROPFIND 返回 405，
         # 但父目录 Depth:1 查询可以正常列出刚写入的文件。
         files = webdav_listing(auth, subfolder=subfolder)
@@ -834,9 +863,17 @@ def main():
             continue
         log(f"[{index}/{len(songs)}] 找到音源：{found['source']} {found.get('quality', 'FLAC')}")
         artist_folder = safe_name(artist_folder_name(found["artist"]))
-        ensure_webdav_folder(auth, artist_folder)
-        log(f"[{index}/{len(songs)}] 目标文件夹：{artist_folder}")
         filename_title = safe_name(str(found.get("filename_title") or original["title"]).strip())
+        # 单项歌曲名搜索：所有歌手/演唱版本统一放入歌曲名文件夹；
+        # 歌手搜索及“歌曲名+歌手名”搜索仍按歌手分文件夹。
+        single_title_search = (
+            mode == "search"
+            and len(query.split()) == 1
+            and canonical_title(original.get("title", "")) == canonical_title(query)
+        )
+        target_folder = safe_name(str(original.get("title") or filename_title).strip()) if single_title_search else artist_folder
+        ensure_webdav_folder(auth, target_folder)
+        log(f"[{index}/{len(songs)}] 目标文件夹：{target_folder}")
         base_filename = safe_name(f"{filename_title} {original['artist']}.flac")
         local = work / base_filename
         try:
