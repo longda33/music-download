@@ -757,7 +757,8 @@ def upload(auth, local_path, filename, subfolder=None):
     path = alist_file_path(filename, subfolder=subfolder)
     expected = local_path.stat().st_size
     log(f"AList API 上传：{filename}")
-    headers = alist_headers(auth, {"File-Path": path, "Content-Length": str(expected), "Content-Type": "audio/flac", "As-Task": "false"})
+    encoded_path = quote(path, safe="/")
+    headers = alist_headers(auth, {"File-Path": encoded_path, "Content-Length": str(expected), "Content-Type": "audio/flac", "As-Task": "false"})
     with local_path.open("rb") as handle:
         r = requests.put(alist_api(auth, "put"), headers=headers, data=handle, timeout=600)
     r.raise_for_status()
