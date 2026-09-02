@@ -718,7 +718,7 @@ def safe_name(value):
     return (value or "unknown")[:180]
 
 
-def webdav_auth():
+def alist_auth():
     required = ["ALIST_URL", "ALIST_TOKEN"]
     missing = [key for key in required if not os.getenv(key)]
     if missing:
@@ -747,7 +747,7 @@ def alist_api(auth, endpoint):
     return f"{auth[0]}/api/fs/{endpoint.lstrip('/')}"
 
 
-def ensure_webdav_folder(auth, subfolder=None):
+def ensure_alist_folder(auth, subfolder=None):
     path = alist_file_path(subfolder=subfolder)
     r = requests.post(alist_api(auth, "mkdir"), headers=alist_headers(auth, {"Content-Type": "application/json"}), json={"path": path}, timeout=60)
     if r.status_code >= 400:
@@ -760,7 +760,7 @@ def ensure_webdav_folder(auth, subfolder=None):
             r.raise_for_status()
 
 
-def webdav_listing(auth, subfolder=None):
+def alist_listing(auth, subfolder=None):
     path = alist_file_path(subfolder=subfolder)
     r = requests.post(alist_api(auth, "list"), headers=alist_headers(auth, {"Content-Type": "application/json"}), json={"path": path, "password": "", "page": 1, "per_page": 1000, "refresh": True}, timeout=60)
     r.raise_for_status()
@@ -770,13 +770,23 @@ def webdav_listing(auth, subfolder=None):
     result = {}
     for item in (data.get("data") or {}).get("content", []) or []:
         if isinstance(item, dict) and item.get("name"):
-            result[str(item["name"])] = int(item.get("size") or 0)
+            raw_size = item.get("size")
+            try:
+                size = int(raw_size or 0)
+            except (TypeError, ValueError):
+                match = re.match(r"^\s*([0-9]+(?:\.[0-9]+)?)\s*(B|KB|KiB|MB|MiB|GB|GiB)\s*$", str(raw_size or ""), re.I)
+                if match:
+                    number, unit = float(match.group(1)), match.group(2).lower()
+                    size = int(number * {"b": 1, "kb": 1024, "kib": 1024, "mb": 1024**2, "mib": 1024**2, "gb": 1024**3, "gib": 1024**3}[unit])
+                else:
+                    size = 0
+            result[str(item["name"])] = size
     return result
 
 
 def choose_filename(auth, base_filename, size, subfolder=None):
     """同名且相近则跳过；同名不同体积则追加 [xx.xxMB]。"""
-    files = webdav_listing(auth, subfolder=subfolder)
+    files = alist_listing(auth, subfolder=subfolder)
     if base_filename in files and abs(files[base_filename] - size) <= SIZE_TOLERANCE:
         return None
     if base_filename not in files:
@@ -806,17 +816,21 @@ def upload(auth, local_path, filename, subfolder=None):
     if r.status_code >= 400 or data.get("code") != 200:
         # 部分挂载盘会先完成写入，再因解析远端时间失败而返回错误。
         # 只有按文件名和大小确认远端文件存在时，才将此类响应计为成功。
+        last_observed = None
         for attempt in range(3):
             if attempt:
                 time.sleep(5)
             try:
-                files = webdav_listing(auth, subfolder=subfolder)
-                if filename in files and files[filename] == expected:
+                files = alist_listing(auth, subfolder=subfolder)
+                last_observed = files.get(filename)
+                if filename in files and last_observed and abs(last_observed - expected) <= SIZE_TOLERANCE:
                     log(f"AList 返回错误，但远程文件已确认存在：{filename}")
                     return
-            except Exception:
-                pass
+            except Exception as verify_exc:
+                last_observed = f"确认接口异常：{verify_exc}"
         message = data.get("message", data) if isinstance(data, dict) else data
+        if last_observed is not None:
+            log(f"AList 上传后确认未通过：文件={filename}，远程大小={last_observed}，本地大小={expected}")
         raise RuntimeError(f"AList 上传失败：{message}")
 
 
@@ -854,8 +868,8 @@ def main():
     if mode == "search" and len(query.split()) >= 2:
         songs = songs[:1]
     log(f"目录检索完成：共 {len(songs)} 首，三人及以上合唱已过滤")
-    auth = webdav_auth()
-    ensure_webdav_folder(auth)
+    auth = alist_auth()
+    ensure_alist_folder(auth)
     log("AList API 连接正常，开始逐首处理；单项歌曲名搜索保存到歌曲名文件夹，歌手搜索保存到歌手文件夹")
     work = Path("downloaded_music")
     work.mkdir(exist_ok=True)
@@ -881,7 +895,7 @@ def main():
             and canonical_title(original.get("title", "")) == canonical_title(query)
         )
         target_folder = safe_name(normalize_folder_label(original.get("title") or filename_title)) if single_title_search else artist_folder
-        ensure_webdav_folder(auth, target_folder)
+        ensure_alist_folder(auth, target_folder)
         log(f"[{index}/{len(songs)}] 目标文件夹：{target_folder}")
         base_filename = safe_name(f"{filename_title} {original['artist']}.flac")
         local = work / base_filename
@@ -905,7 +919,7 @@ def main():
                                 log(f"[{index}/{len(songs)}] 已下载：{downloaded / 1048576:.2f} MiB")
                             last_report = now
             actual = local.stat().st_size
-            log(f"[{index}/{len(songs)}] 下载完成：{actual / 1048576:.2f} MiB，检查 WebDAV 文件")
+            log(f"[{index}/{len(songs)}] 下载完成：{actual / 1048576:.2f} MiB，上传前检查 AList 目录文件")
             if found["size"] and abs(actual - found["size"]) > SIZE_TOLERANCE:
                 raise RuntimeError(f"体积异常 {actual}/{found['size']}")
             embed_metadata(local, found)
@@ -914,7 +928,7 @@ def main():
             if filename is None:
                 local.unlink(missing_ok=True)
                 skipped += 1
-                log(f"[{index}/{len(songs)}] 跳过：WebDAV 已存在相同文件")
+                log(f"[{index}/{len(songs)}] 跳过：AList 已存在相同文件")
                 continue
             upload(auth, local, filename, subfolder=target_folder)
             local.unlink(missing_ok=True)
