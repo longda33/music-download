@@ -207,10 +207,17 @@ def canonical_title(value):
     return dedup_key(value)
 
 
+def normalize_folder_label(value):
+    """统一文件夹显示名；去除中文字符之间被音源错误插入的空格。"""
+    text = unicodedata.normalize("NFKC", to_simplified(str(value or ""))).strip()
+    text = re.sub(r"(?<=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])\s+(?=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])", "", text)
+    return text or "unknown"
+
+
 def artist_folder_name(value):
     """将中英文艺人别名统一为稳定的文件夹名称。"""
     key = canonical_artist(value)
-    return ARTIST_FOLDER_NAMES.get(key, to_simplified(str(value).strip()))
+    return normalize_folder_label(ARTIST_FOLDER_NAMES.get(key, str(value).strip()))
 
 
 def identity_keys(song):
@@ -223,6 +230,9 @@ def identity_keys(song):
     for artist_id in song.get("artist_ids", []):
         if artist_id:
             keys.append(("artist-id-title", str(artist_id).casefold(), title_key))
+    for platform, value in (song.get("platform_ids") or {}).items():
+        if value:
+            keys.append(("platform-id", platform, str(value).casefold()))
     keys.append(("name", title_key, canonical_artist(song.get("artist", ""))))
     return keys
 
@@ -253,7 +263,7 @@ def platform_discover(query):
             title = row.get("song_title") or row.get("song_name")
             artist = row.get("singer_name")
             if accept(title, artist):
-                candidates.append({"title": title, "artist": artist, "artist_ids": [], "recording_id": None, "isrc": None, "year": None})
+                candidates.append({"title": title, "artist": artist, "platform_ids": {"qq_song_mid": row.get("song_mid")}, "artist_ids": [], "recording_id": None, "isrc": None, "year": None})
     except Exception as exc:
         log(f"QQ 实时目录搜索失败：{exc}")
 
@@ -263,7 +273,7 @@ def platform_discover(query):
         for row in rows:
             title, artist = row.get("song"), row.get("singer")
             if accept(title, artist):
-                candidates.append({"title": title, "artist": artist, "artist_ids": [], "recording_id": None, "isrc": None, "year": None})
+                candidates.append({"title": title, "artist": artist, "platform_ids": {"kuwo_rid": row.get("rid")}, "artist_ids": [], "recording_id": None, "isrc": None, "year": None})
     except Exception as exc:
         log(f"酷我实时目录搜索失败：{exc}")
 
@@ -273,7 +283,9 @@ def platform_discover(query):
         for row in rows:
             title, artist = row.get("name"), row.get("artist")
             if accept(title, artist):
-                candidates.append({"title": title, "artist": artist, "artist_ids": [], "recording_id": None, "isrc": None, "year": None})
+                netease_song_id = parse_qs(urlparse(str(row.get("url") or "")).query).get("id", [""])[0]
+                netease_cover_id = parse_qs(urlparse(str(row.get("pic") or "")).query).get("id", [""])[0]
+                candidates.append({"title": title, "artist": artist, "platform_ids": {"netease_song_id": netease_song_id, "netease_cover_id": netease_cover_id}, "artist_ids": [], "recording_id": None, "isrc": None, "year": None})
     except Exception as exc:
         log(f"网易云实时目录搜索失败：{exc}")
     return candidates
@@ -434,13 +446,13 @@ def qq_search(title, artist):
     for row in rows[:3]:
         if not isinstance(row, dict) or not row.get("song_mid"):
             continue
-        detail = request_json(QQ_API, {"mid": row["song_mid"]}, SOURCE_HEADERS, timeout=DETAIL_TIMEOUT, retries=1)
+        detail = request_json(QQ_API, {"msg": f"{title} {artist}", "type": "json", "mid": row["song_mid"]}, SOURCE_HEADERS, timeout=DETAIL_TIMEOUT, retries=1)
         source_title = str(detail.get("song_title") or detail.get("song_name") or row.get("song_title") or title).strip()
         for tier, label in (("sq", "SQ"), ("pq", "PQ")):
             url = detail.get(f"song_play_url_{tier}")
             filename = detail.get(f"song_filename_{tier}")
             if url and filename and str(filename).lower().endswith(".flac"):
-                return {"url": url, "filename": filename, "filename_title": source_title, "size": int(detail.get(f"song_size_{tier}_str") or 0), "source": "QQ", "quality": label}
+                return {"url": url, "filename": filename, "filename_title": source_title, "size": int(detail.get(f"song_size_{tier}_str") or 0), "source": "QQ", "quality": label, "platform_ids": {"qq_song_id": detail.get("song_id"), "qq_song_mid": detail.get("song_mid") or row.get("song_mid"), "qq_singer_id": detail.get("singer_id"), "qq_singer_mid": detail.get("singer_mid")}}
     return None
 
 
@@ -495,7 +507,7 @@ def kuwo_search(title, artist):
         url = item.get("url") if isinstance(item, dict) else ""
         fmt = str(item.get("format", "")).lower() if isinstance(item, dict) else ""
         if url and fmt == "flac" and str(url).lower().split("?")[0].endswith(".flac"):
-            return {"url": url, "filename": f"{title}.flac", "filename_title": str(item.get("song") or title).strip(), "size": size_bytes(item.get("size", "")), "source": "酷我", "quality": f"FLAC {item.get('bitrate', '2000')}kbps"}
+            return {"url": url, "filename": f"{title}.flac", "filename_title": str(item.get("song") or title).strip(), "size": size_bytes(item.get("size", "")), "source": "酷我", "quality": f"FLAC {item.get('bitrate', '2000')}kbps", "platform_ids": {"kuwo_id": item.get("id"), "kuwo_rid": item.get("rid") or row.get("rid")}}
     return None
 
 
@@ -518,7 +530,7 @@ def netease_search(title, artist):
             size = int(probe.headers.get("content-length", 0) or 0)
             probe.close()
             if is_flac:
-                return {"url": download_url, "filename": f"{title}.flac", "filename_title": str(row_title).strip(), "size": size, "source": "网易云", "quality": "FLAC"}
+                return {"url": download_url, "filename": f"{title}.flac", "filename_title": str(row_title).strip(), "size": size, "source": "网易云", "quality": "FLAC", "platform_ids": {"netease_song_id": song_id, "netease_cover_id": parse_qs(urlparse(str(row.get("pic") or "")).query).get("id", [""])[0]}}
         except Exception:
             pass
     return None
@@ -530,8 +542,10 @@ def find_source(song):
         try:
             item = func(song["title"], song["artist"])
             if item:
-                # 保留目录发现阶段的原始标题/歌手，音源只补充下载字段。
-                found.append({**item, **song})
+                # 保留目录发现和音源详情中的平台 ID。
+                merged = {**item, **song}
+                merged["platform_ids"] = {**item.get("platform_ids", {}), **song.get("platform_ids", {})}
+                found.append(merged)
         except Exception as exc:
             log(f"{func.__name__} 搜索失败：{exc}")
     if not found:
@@ -761,13 +775,25 @@ def upload(auth, local_path, filename, subfolder=None):
     headers = alist_headers(auth, {"File-Path": encoded_path, "Content-Length": str(expected), "Content-Type": "audio/flac", "As-Task": "false"})
     with local_path.open("rb") as handle:
         r = requests.put(alist_api(auth, "put"), headers=headers, data=handle, timeout=600)
-    r.raise_for_status()
     try:
         data = r.json()
     except ValueError as exc:
         raise RuntimeError(f"AList 上传返回非 JSON：HTTP {r.status_code}") from exc
-    if data.get("code") != 200:
-        raise RuntimeError(f"AList 上传失败：{data.get('message', data)}")
+    if r.status_code >= 400 or data.get("code") != 200:
+        # 部分挂载盘会先完成写入，再因解析远端时间失败而返回错误。
+        # 只有按文件名和大小确认远端文件存在时，才将此类响应计为成功。
+        for attempt in range(3):
+            if attempt:
+                time.sleep(5)
+            try:
+                files = webdav_listing(auth, subfolder=subfolder)
+                if filename in files and files[filename] == expected:
+                    log(f"AList 返回错误，但远程文件已确认存在：{filename}")
+                    return
+            except Exception:
+                pass
+        message = data.get("message", data) if isinstance(data, dict) else data
+        raise RuntimeError(f"AList 上传失败：{message}")
 
 
 def callback(payload):
@@ -830,7 +856,7 @@ def main():
             and len(query.split()) == 1
             and canonical_title(original.get("title", "")) == canonical_title(query)
         )
-        target_folder = safe_name(str(original.get("title") or filename_title).strip()) if single_title_search else artist_folder
+        target_folder = safe_name(normalize_folder_label(original.get("title") or filename_title)) if single_title_search else artist_folder
         ensure_webdav_folder(auth, target_folder)
         log(f"[{index}/{len(songs)}] 目标文件夹：{target_folder}")
         base_filename = safe_name(f"{filename_title} {original['artist']}.flac")
