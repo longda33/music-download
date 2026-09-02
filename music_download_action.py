@@ -681,58 +681,58 @@ def safe_name(value):
 
 
 def webdav_auth():
-    required = ["WEBDAV_URL", "WEBDAV_USERNAME", "WEBDAV_PASSWORD"]
+    required = ["ALIST_URL", "ALIST_TOKEN"]
     missing = [key for key in required if not os.getenv(key)]
     if missing:
-        fail("缺少 WebDAV Secret: " + ", ".join(missing))
-    return (os.environ["WEBDAV_USERNAME"], os.environ["WEBDAV_PASSWORD"])
+        fail("缺少 AList Secret: " + ", ".join(missing))
+    return (os.environ["ALIST_URL"].rstrip("/"), os.environ["ALIST_TOKEN"])
 
 
-def webdav_path(filename=None, subfolder=None):
-    base = os.environ["WEBDAV_URL"].rstrip("/")
-    folder = os.getenv("WEBDAV_FOLDER", "Music").strip("/")
-    parts = folder.split("/") if folder else []
+def alist_headers(auth, extra=None):
+    headers = {"Authorization": auth[1]}
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def alist_file_path(filename=None, subfolder=None):
+    base = (os.getenv("ALIST_PATH") or "/cd18/Music").strip("/")
+    parts = [part for part in base.split("/") if part]
     if subfolder:
         parts.append(str(subfolder).strip("/"))
     if filename:
-        parts.append(filename)
-    path = "/".join(quote(part, safe="") for part in parts)
-    return f"{base}/{path}"
+        parts.append(str(filename).strip("/"))
+    return "/" + "/".join(parts)
+
+
+def alist_api(auth, endpoint):
+    return f"{auth[0]}/api/fs/{endpoint.lstrip('/')}"
 
 
 def ensure_webdav_folder(auth, subfolder=None):
-    # 目录应提前创建；已存在时 WebDAV 返回 405，忽略即可。
-    url = webdav_path(subfolder=subfolder)
-    r = requests.request("MKCOL", url, auth=auth, timeout=60)
-    if r.status_code not in (201, 405, 409):
-        r.raise_for_status()
+    path = alist_file_path(subfolder=subfolder)
+    r = requests.post(alist_api(auth, "mkdir"), headers=alist_headers(auth, {"Content-Type": "application/json"}), json={"path": path}, timeout=60)
+    if r.status_code >= 400:
+        try:
+            data = r.json()
+        except ValueError:
+            data = {}
+        # AList 已存在目录时返回错误，后续 list/put 仍可正常进行。
+        if data.get("code") not in (200, 400):
+            r.raise_for_status()
 
 
 def webdav_listing(auth, subfolder=None):
-    xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?><d:propfind xmlns:d=\"DAV:\"><d:prop><d:displayname/><d:getcontentlength/></d:prop></d:propfind>"
-    r = requests.request("PROPFIND", webdav_path(subfolder=subfolder), auth=auth, headers={"Depth": "1", "Content-Type": "application/xml"}, data=xml.encode(), timeout=60)
+    path = alist_file_path(subfolder=subfolder)
+    r = requests.post(alist_api(auth, "list"), headers=alist_headers(auth, {"Content-Type": "application/json"}), json={"path": path, "password": "", "page": 1, "per_page": 1000, "refresh": True}, timeout=60)
     r.raise_for_status()
-    root = __import__("xml.etree.ElementTree", fromlist=["ElementTree"]).fromstring(r.content)
-    ns = {"d": "DAV:"}
+    data = r.json()
+    if data.get("code") != 200:
+        raise RuntimeError(f"AList 列目录失败：{data.get('message', data)}")
     result = {}
-    for response in root.findall("d:response", ns):
-        prop = response.find("d:propstat/d:prop", ns)
-        if prop is None:
-            continue
-        name = response.findtext("d:propstat/d:prop/d:displayname", default="", namespaces=ns)
-        # 部分 WebDAV 服务不返回 displayname，或返回完整路径；
-        # 此时从 href 取最后一段并 URL 解码，避免 405 后误判上传失败。
-        href = response.findtext("d:href", default="", namespaces=ns)
-        if not name and href:
-            name = unquote(urlparse(href).path.rstrip("/").rsplit("/", 1)[-1])
-        elif name and "/" in name:
-            name = unquote(urlparse(name).path.rstrip("/").rsplit("/", 1)[-1])
-        length = prop.findtext("d:getcontentlength", default="0", namespaces=ns)
-        if name:
-            try:
-                result[name] = int(length or 0)
-            except (TypeError, ValueError):
-                result[name] = 0
+    for item in (data.get("data") or {}).get("content", []) or []:
+        if isinstance(item, dict) and item.get("name"):
+            result[str(item["name"])] = int(item.get("size") or 0)
     return result
 
 
@@ -753,72 +753,20 @@ def choose_filename(auth, base_filename, size, subfolder=None):
     return f"{stem} [{size / (1024 * 1024):.2f}MB] ({n}){ext}"
 
 
-def remote_size(auth, url):
-    try:
-        head = requests.head(url, auth=auth, timeout=30, allow_redirects=True)
-        if head.status_code in (200, 204) and head.headers.get("content-length"):
-            return int(head.headers["content-length"])
-    except Exception:
-        pass
-    try:
-        r = requests.request("PROPFIND", url, auth=auth, headers={"Depth": "0"}, timeout=30)
-        if r.status_code in (200, 207):
-            root = __import__("xml.etree.ElementTree", fromlist=["ElementTree"]).fromstring(r.content)
-            ns = {"d": "DAV:"}
-            value = root.findtext(".//d:getcontentlength", default="", namespaces=ns)
-            return int(value) if value else None
-    except Exception:
-        pass
-    return None
-
-
-def verify_webdav_upload(auth, url, filename, expected, subfolder=None):
-    """验证 PUT 非 2xx 后文件是否实际已写入 WebDAV。"""
-    actual = remote_size(auth, url)
-    if actual is not None and actual == expected:
-        return True
-    try:
-        # AList 某些驱动上传成功后，文件地址的 HEAD/PROPFIND 可能异常；
-        # 用 Range GET 验证目标文件可读取，避免把已上传文件误报为失败。
-        probe = requests.get(url, auth=auth, headers={"Range": "bytes=0-0"}, stream=True, timeout=30, allow_redirects=True)
-        exists = probe.status_code in (200, 206)
-        probe.close()
-        if exists:
-            return True
-    except Exception:
-        pass
-    try:
-        # 某些 WebDAV 服务对文件地址的 HEAD/PROPFIND 返回 405，
-        # 但父目录 Depth:1 查询可以正常列出刚写入的文件。
-        files = webdav_listing(auth, subfolder=subfolder)
-        if filename in files:
-            listed = files[filename]
-            if listed != expected:
-                log(f"WebDAV 远程大小记录为 {listed}，本地大小为 {expected}，但文件已确认存在")
-            return True
-    except Exception:
-        pass
-    return False
-
-
 def upload(auth, local_path, filename, subfolder=None):
-    url = webdav_path(filename, subfolder=subfolder)
+    path = alist_file_path(filename, subfolder=subfolder)
     expected = local_path.stat().st_size
-    log(f"WebDAV PUT：{filename}")
+    log(f"AList API 上传：{filename}")
+    headers = alist_headers(auth, {"File-Path": path, "Content-Length": str(expected), "Content-Type": "audio/flac", "As-Task": "false"})
     with local_path.open("rb") as handle:
-        r = requests.put(url, auth=auth, data=handle, headers={"Content-Length": str(expected), "Content-Type": "audio/flac"}, timeout=600)
-    if r.status_code in (200, 201, 204):
-        return
-    if r.status_code == 405:
-        # 部分服务 PUT 后返回 405；等待远端目录刷新，再严格确认文件存在。
-        for attempt in range(3):
-            if verify_webdav_upload(auth, url, filename, expected, subfolder=subfolder):
-                log(f"WebDAV 返回 405，但远程文件已确认存在：{filename}")
-                return
-            if attempt < 2:
-                time.sleep(3)
-        raise RuntimeError(f"WebDAV PUT 返回 405，远程未找到文件：{url}")
-    raise RuntimeError(f"WebDAV PUT 失败 HTTP {r.status_code}: {url}")
+        r = requests.put(alist_api(auth, "put"), headers=headers, data=handle, timeout=600)
+    r.raise_for_status()
+    try:
+        data = r.json()
+    except ValueError as exc:
+        raise RuntimeError(f"AList 上传返回非 JSON：HTTP {r.status_code}") from exc
+    if data.get("code") != 200:
+        raise RuntimeError(f"AList 上传失败：{data.get('message', data)}")
 
 
 def callback(payload):
@@ -857,7 +805,7 @@ def main():
     log(f"目录检索完成：共 {len(songs)} 首，三人及以上合唱已过滤")
     auth = webdav_auth()
     ensure_webdav_folder(auth)
-    log("WebDAV 连接正常，开始逐首处理；单项歌曲名搜索保存到歌曲名文件夹，歌手搜索保存到歌手文件夹")
+    log("AList API 连接正常，开始逐首处理；单项歌曲名搜索保存到歌曲名文件夹，歌手搜索保存到歌手文件夹")
     work = Path("downloaded_music")
     work.mkdir(exist_ok=True)
     success = 0
