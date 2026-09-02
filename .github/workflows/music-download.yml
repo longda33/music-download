@@ -19,10 +19,9 @@ jobs:
     timeout-minutes: 360
     env:
       PYTHONUNBUFFERED: '1'
-      WEBDAV_URL: ${{ secrets.WEBDAV_URL }}
-      WEBDAV_USERNAME: ${{ secrets.WEBDAV_USERNAME }}
-      WEBDAV_PASSWORD: ${{ secrets.WEBDAV_PASSWORD }}
-      WEBDAV_FOLDER: ${{ secrets.WEBDAV_FOLDER }}
+      ALIST_URL: ${{ secrets.ALIST_URL }}
+      ALIST_TOKEN: ${{ secrets.ALIST_TOKEN }}
+      ALIST_PATH: ${{ secrets.ALIST_PATH }}
       LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
     steps:
       - name: Checkout repository
