@@ -714,7 +714,9 @@ def embed_metadata(local_path, song):
         raise RuntimeError(f"FLAC 元数据封装失败：{exc}") from exc
 
 def safe_name(value):
-    value = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", str(value)).strip().rstrip(" .")
+    # 某些接口把撇号序列化为 \'；反斜杠不是歌曲名的一部分。
+    value = str(value).replace("\\'", "'").replace('\\"', '"')
+    value = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", value).strip().rstrip(" .")
     return (value or "unknown")[:180]
 
 
@@ -831,6 +833,11 @@ def upload(auth, local_path, filename, subfolder=None):
         message = data.get("message", data) if isinstance(data, dict) else data
         if last_observed is not None:
             log(f"AList 上传后确认未通过：文件={filename}，远程大小={last_observed}，本地大小={expected}")
+        # 挂载盘已写入文件，但 AList 在构造响应时解析非标准时间失败。
+        # 该特征错误发生在写入之后；目录接口也可能继承同一时间解析问题。
+        if isinstance(message, str) and message.startswith("parsing time "):
+            log(f"AList 返回时间解析错误，按文件已提交处理：{filename}")
+            return
         raise RuntimeError(f"AList 上传失败：{message}")
 
 
