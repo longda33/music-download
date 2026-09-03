@@ -714,9 +714,10 @@ def embed_metadata(local_path, song):
         raise RuntimeError(f"FLAC 元数据封装失败：{exc}") from exc
 
 def safe_name(value):
-    # 某些接口把撇号序列化为 \'；反斜杠不是歌曲名的一部分。
+    # 挂载存储对撇号和反斜杠的转义不一致，文件名统一去除这两类字符。
     value = str(value).replace("/'", "'").replace("\\'", "'").replace('\\"', '"')
-    value = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", value).strip().rstrip(" .")
+    value = value.replace("'", "").replace("\\", "")
+    value = re.sub(r'[/:*?"<>|\x00-\x1f]', "_", value).strip().rstrip(" .")
     return (value or "unknown")[:180]
 
 
