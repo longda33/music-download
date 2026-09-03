@@ -159,9 +159,8 @@ ARTIST_FOLDER_NAMES = {
     "dengshimeijun": "等什么君",
 }
 GEMINI_ARTIST_CACHE = {}
-GEMINI_MATCH_CACHE = {}
-GEMINI_MATCH_CALLS = 0
-MAX_GEMINI_MATCH_CALLS = 20
+GEMINI_BATCH_CACHE = {}
+GEMINI_RATE_LIMITED = False
 
 
 def dedup_key(value):
@@ -228,10 +227,11 @@ def normalize_folder_label(value):
 
 def gemini_artist_alias(value, related=None):
     """用 Gemini 判断两个艺人名称是否同一身份，并选择稳定名称。"""
+    global GEMINI_RATE_LIMITED
     raw = normalize_folder_label(value)
     related = normalize_folder_label(related) if related else raw
     api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key or not raw:
+    if not api_key or not raw or GEMINI_RATE_LIMITED:
         return raw
     cache_key = (raw.casefold(), related.casefold())
     if cache_key in GEMINI_ARTIST_CACHE:
@@ -257,6 +257,11 @@ def gemini_artist_alias(value, related=None):
             json=body,
             timeout=20,
         )
+        if response.status_code == 429:
+            GEMINI_RATE_LIMITED = True
+            log("Gemini API 达到频率/配额限制，本次任务关闭后续 AI 判断，回退本地规则")
+            GEMINI_ARTIST_CACHE[cache_key] = raw
+            return raw
         response.raise_for_status()
         data = response.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"]
@@ -275,26 +280,26 @@ def gemini_artist_alias(value, related=None):
         return raw
 
 
-def gemini_song_match(title_a, artist_a, title_b, artist_b):
-    """判断两个歌曲候选是否同一首；AI 失败时必须返回 False。"""
-    global GEMINI_MATCH_CALLS
+def gemini_batch_filter(query, candidates):
+    """一次性判断本地初筛后的候选，返回可接受的候选序号。"""
+    global GEMINI_RATE_LIMITED
     api_key = os.getenv("GEMINI_API_KEY")
-    values = tuple(normalize_folder_label(x) for x in (title_a, artist_a, title_b, artist_b))
-    cache_key = tuple(x.casefold() for x in values)
-    if cache_key in GEMINI_MATCH_CACHE:
-        return GEMINI_MATCH_CACHE[cache_key]
-    if not api_key or GEMINI_MATCH_CALLS >= MAX_GEMINI_MATCH_CALLS:
-        return False
-    GEMINI_MATCH_CALLS += 1
+    if not api_key or GEMINI_RATE_LIMITED or not candidates:
+        return set()
+    items = [{"index": i, "title": normalize_folder_label(item.get("title")), "artist": normalize_folder_label(item.get("artist"))}
+             for i, item in enumerate(candidates)]
+    cache_key = json.dumps([query, items], ensure_ascii=False, sort_keys=True)
+    if cache_key in GEMINI_BATCH_CACHE:
+        return GEMINI_BATCH_CACHE[cache_key]
     model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
     prompt = (
-        "你是严格的音乐元数据匹配器。判断两组歌曲是否同一首录音。\n"
+        "你是严格的音乐元数据批量匹配器。根据用户查询，从候选列表中选出匹配的歌曲。\n"
         "允许：中英文艺人别名、常见官方译名、标点和空格差异。\n"
         "禁止合并：不同歌曲、翻唱、Live/现场、Remix、DJ版、伴奏版、不同录音版本。\n"
-        "只有明确确认时才返回 true；不确定必须返回 false。只返回 JSON："
-        '{"same_recording":false,"confidence":0.0,"reason":"..."}\n'
-        f"A：歌名<<<{values[0]}>>>，艺人<<<{values[1]}>>>\n"
-        f"B：歌名<<<{values[2]}>>>，艺人<<<{values[3]}>>>"
+        "只返回明确匹配且置信度至少 0.92 的候选序号；不确定不要选。只返回 JSON："
+        '{"matches":[{"index":0,"confidence":0.0,"reason":"..."}]}\n'
+        f"用户查询：<<<{normalize_folder_label(query)}>>>\n"
+        f"候选列表：{json.dumps(items, ensure_ascii=False)}"
     )
     try:
         response = requests.post(
@@ -303,17 +308,22 @@ def gemini_song_match(title_a, artist_a, title_b, artist_b):
             json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0, "responseMimeType": "application/json"}},
             timeout=20,
         )
+        if response.status_code == 429:
+            GEMINI_RATE_LIMITED = True
+            log("Gemini API 达到频率/配额限制，本次任务关闭 AI 批量筛选，回退本地结果")
+            return set()
         response.raise_for_status()
         result = json.loads(response.json()["candidates"][0]["content"]["parts"][0]["text"])
-        matched = bool(result.get("same_recording")) and float(result.get("confidence") or 0) >= 0.92
-        GEMINI_MATCH_CACHE[cache_key] = matched
-        if matched:
-            log(f"Gemini 歌曲别名匹配：{title_a} - {artist_a} ≈ {title_b} - {artist_b}")
+        matched = {int(item["index"]) for item in result.get("matches", [])
+                   if isinstance(item, dict) and float(item.get("confidence") or 0) >= 0.92
+                   and 0 <= int(item.get("index", -1)) < len(candidates)}
+        GEMINI_BATCH_CACHE[cache_key] = matched
+        log(f"Gemini 批量歌曲别名筛选：输入 {len(candidates)} 首，匹配 {len(matched)} 首")
         return matched
     except Exception as exc:
-        log(f"Gemini 歌曲别名匹配跳过：{exc}")
-        GEMINI_MATCH_CACHE[cache_key] = False
-        return False
+        log(f"Gemini 批量歌曲别名筛选跳过：{exc}")
+        GEMINI_BATCH_CACHE[cache_key] = set()
+        return set()
 
 
 def artist_folder_name(value, related=None):
@@ -350,18 +360,26 @@ def platform_discover(query):
             left, right = " ".join(parts[:cut]), " ".join(parts[cut:])
             pair_terms.extend([(left, right), (right, left)])
 
-    def accept(title, artist):
+    def exact_accept(title, artist):
         title, artist = str(title or "").strip(), str(artist or "").strip()
         if not title or not artist:
             return False
         if len(parts) == 1:
             return True
-        if any(canonical_title(title) == canonical_title(t)
-               and canonical_artist(artist) == canonical_artist(a)
-               for t, a in pair_terms):
+        return any(canonical_title(title) == canonical_title(t)
+                   and canonical_artist(artist) == canonical_artist(a)
+                   for t, a in pair_terms)
+
+    def accept(title, artist):
+        """GitHub Action 初筛：至少标题或艺人命中，剩余交给 Gemini。"""
+        title, artist = str(title or "").strip(), str(artist or "").strip()
+        if not title or not artist:
+            return False
+        if len(parts) == 1:
             return True
-        # 只有规则匹配失败时才调用 Gemini，避免每个候选都产生 API 请求。
-        return any(gemini_song_match(t, a, title, artist) for t, a in pair_terms[:4])
+        return any(canonical_title(title) == canonical_title(t)
+                   or canonical_artist(artist) == canonical_artist(a)
+                   for t, a in pair_terms)
 
     try:
         rows = request_json(QQ_API, {"msg": query, "type": "json"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=1)
@@ -369,7 +387,7 @@ def platform_discover(query):
             title = row.get("song_title") or row.get("song_name")
             artist = row.get("singer_name")
             if accept(title, artist):
-                candidates.append({"title": title, "artist": artist, "platform_ids": {"qq_song_mid": row.get("song_mid")}, "artist_ids": [], "recording_id": None, "isrc": None, "year": None})
+                candidates.append({"title": title, "artist": artist, "platform_ids": {"qq_song_mid": row.get("song_mid")}, "artist_ids": [], "recording_id": None, "isrc": None, "year": None, "_exact_match": exact_accept(title, artist)})
     except Exception as exc:
         log(f"QQ 实时目录搜索失败：{exc}")
 
@@ -379,7 +397,7 @@ def platform_discover(query):
         for row in rows:
             title, artist = row.get("song"), row.get("singer")
             if accept(title, artist):
-                candidates.append({"title": title, "artist": artist, "platform_ids": {"kuwo_rid": row.get("rid")}, "artist_ids": [], "recording_id": None, "isrc": None, "year": None})
+                candidates.append({"title": title, "artist": artist, "platform_ids": {"kuwo_rid": row.get("rid")}, "artist_ids": [], "recording_id": None, "isrc": None, "year": None, "_exact_match": exact_accept(title, artist)})
     except Exception as exc:
         log(f"酷我实时目录搜索失败：{exc}")
 
@@ -391,10 +409,14 @@ def platform_discover(query):
             if accept(title, artist):
                 netease_song_id = parse_qs(urlparse(str(row.get("url") or "")).query).get("id", [""])[0]
                 netease_cover_id = parse_qs(urlparse(str(row.get("pic") or "")).query).get("id", [""])[0]
-                candidates.append({"title": title, "artist": artist, "platform_ids": {"netease_song_id": netease_song_id, "netease_cover_id": netease_cover_id}, "artist_ids": [], "recording_id": None, "isrc": None, "year": None})
+                candidates.append({"title": title, "artist": artist, "platform_ids": {"netease_song_id": netease_song_id, "netease_cover_id": netease_cover_id}, "artist_ids": [], "recording_id": None, "isrc": None, "year": None, "_exact_match": exact_accept(title, artist)})
     except Exception as exc:
         log(f"网易云实时目录搜索失败：{exc}")
-    return candidates
+    exact, pending = [], []
+    for item in candidates:
+        (exact if item.pop("_exact_match", False) else pending).append(item)
+    matched = gemini_batch_filter(query, pending)
+    return exact + [{**item, "_gemini_match": True} for index, item in enumerate(pending) if index in matched]
 
 
 def exact_pair_match(song, query):
@@ -408,9 +430,7 @@ def exact_pair_match(song, query):
         left, right = " ".join(parts[:cut]), " ".join(parts[cut:])
         if (title == canonical_title(left) and artist == canonical_artist(right)) or (title == canonical_title(right) and artist == canonical_artist(left)):
             return True
-    pairs = [(" ".join(parts[:cut]), " ".join(parts[cut:])) for cut in range(1, len(parts))]
-    return any(gemini_song_match(left, right, song.get("title", ""), song.get("artist", ""))
-               for left, right in pairs[:4])
+    return False
 
 
 def discover_songs(mode, query):
@@ -524,7 +544,7 @@ def discover_songs(mode, query):
         if mode == "search":
             parts = query.split()
             if len(parts) >= 2:
-                if not exact_pair_match(song, query):
+                if not song.pop("_gemini_match", False) and not exact_pair_match(song, query):
                     continue
             else:
                 # 单项搜索必须是歌曲名或歌手名完全匹配；
