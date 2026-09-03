@@ -23,6 +23,8 @@ jobs:
       ALIST_TOKEN: ${{ secrets.ALIST_TOKEN }}
       ALIST_PATH: ${{ secrets.ALIST_PATH }}
       LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      GEMINI_MODEL: ${{ secrets.GEMINI_MODEL || 'gemini-3.5-flash-lite' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
