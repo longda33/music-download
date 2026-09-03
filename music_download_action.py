@@ -230,6 +230,8 @@ def gemini_artist_alias(value, related=None):
     global GEMINI_RATE_LIMITED
     raw = normalize_folder_label(value)
     related = normalize_folder_label(related) if related else raw
+    if canonical_artist(raw) == canonical_artist(related):
+        return raw
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key or not raw or GEMINI_RATE_LIMITED:
         return raw
@@ -255,7 +257,7 @@ def gemini_artist_alias(value, related=None):
             f"{GEMINI_API}/{model}:generateContent",
             headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
             json=body,
-            timeout=20,
+            timeout=float(os.getenv("GEMINI_TIMEOUT", "8")),
         )
         if response.status_code == 429:
             GEMINI_RATE_LIMITED = True
@@ -306,7 +308,7 @@ def gemini_batch_filter(query, candidates):
             f"{GEMINI_API}/{model}:generateContent",
             headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
             json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0, "responseMimeType": "application/json"}},
-            timeout=20,
+            timeout=float(os.getenv("GEMINI_TIMEOUT", "8")),
         )
         if response.status_code == 429:
             GEMINI_RATE_LIMITED = True
@@ -1022,7 +1024,6 @@ def main():
             failed.append(label)
             continue
         log(f"[{index}/{len(songs)}] 找到音源：{found['source']} {found.get('quality', 'FLAC')}")
-        artist_folder = safe_name(artist_folder_name(found["artist"], original.get("artist")))
         filename_title = safe_name(str(found.get("filename_title") or original["title"]).strip())
         # 单项歌曲名搜索：所有歌手/演唱版本统一放入歌曲名文件夹；
         # 歌手搜索及“歌曲名+歌手名”搜索仍按歌手分文件夹。
@@ -1031,6 +1032,9 @@ def main():
             and len(query.split()) == 1
             and canonical_title(original.get("title", "")) == canonical_title(query)
         )
+        artist_folder = ""
+        if not single_title_search:
+            artist_folder = safe_name(artist_folder_name(found["artist"], original.get("artist")))
         target_folder = safe_name(normalize_folder_label(original.get("title") or filename_title)) if single_title_search else artist_folder
         ensure_alist_folder(auth, target_folder)
         log(f"[{index}/{len(songs)}] 目标文件夹：{target_folder}")
