@@ -208,9 +208,16 @@ def canonical_title(value):
 
 
 def normalize_folder_label(value):
-    """统一文件夹显示名；去除中文字符之间被音源错误插入的空格。"""
+    """生成稳定的文件夹名，消除括号、空格和全角字符造成的重复目录。"""
     text = unicodedata.normalize("NFKC", to_simplified(str(value or ""))).strip()
+    # 不同平台可能返回全角/半角括号或混用括号；文件夹统一使用半角括号。
+    text = text.translate(str.maketrans({"（": "(", "）": ")", "［": "[", "］": "]", "【": "[", "】": "]", "｛": "{", "｝": "}"}))
+    # 去掉括号前后空格，也处理括号内部由平台插入的多余空格。
+    text = re.sub(r"\s*([()\[\]{}])\s*", r"\1", text)
+    # 中文字符之间的错误空格：芳 华 慢 → 芳华慢。
     text = re.sub(r"(?<=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])\s+(?=[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff])", "", text)
+    # 其余连续空白统一为一个普通空格。
+    text = re.sub(r"\s+", " ", text).strip()
     return text or "unknown"
 
 
