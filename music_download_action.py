@@ -1074,7 +1074,10 @@ def main():
         single_title_search = (
             mode == "search"
             and len(query_terms(query)) == 1
-            and canonical_title(original.get("title", "")) == canonical_title(query)
+            and (
+                canonical_title(original.get("title", "")) == canonical_title(query)
+                or is_title_variant(original.get("title", ""), query)
+            )
         )
         artist_folder = ""
         if not single_title_search:
