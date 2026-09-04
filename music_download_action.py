@@ -986,6 +986,7 @@ def callback(payload):
         "status": payload.get("status", "completed"),
         "cancelled": payload.get("cancelled", False),
         "success_count": payload.get("success_count", 0),
+        "skipped_count": payload.get("skipped_count", 0),
         "failed_songs": payload.get("failed_songs", []),
         "error": payload.get("error", ""),
     }
@@ -1007,6 +1008,18 @@ def main():
     if mode == "search" and len(query.split()) >= 2:
         songs = songs[:1]
     log(f"目录检索完成：共 {len(songs)} 首，三人及以上合唱已过滤")
+    if not songs:
+        message = "未搜索到歌曲，请检查输入的歌曲名称或歌手名称是否正确。"
+        log(message)
+        payload["status"] = "no_results"
+        payload["cancelled"] = False
+        payload["success_count"] = 0
+        payload["skipped_count"] = 0
+        payload["failed_songs"] = []
+        payload["error"] = message
+        callback(payload)
+        print(json.dumps({"status": "no_results", "success_count": 0, "skipped_count": 0, "failed_songs": [], "error": message}, ensure_ascii=False))
+        return
     auth = alist_auth()
     ensure_alist_folder(auth)
     log("AList API 连接正常，开始逐首处理；单项歌曲名搜索保存到歌曲名文件夹，歌手搜索保存到歌手文件夹")
@@ -1081,9 +1094,12 @@ def main():
             log(f"[{index}/{len(songs)}] 失败：{exc}")
     log(f"任务完成：上传 {success} 首，跳过 {skipped} 首，失败 {len(failed)} 首")
     payload["success_count"] = success
+    payload["skipped_count"] = skipped
     payload["failed_songs"] = failed
+    payload["status"] = "completed"
+    payload["cancelled"] = False
     callback(payload)
-    print(json.dumps({"success_count": success, "failed_songs": failed}, ensure_ascii=False))
+    print(json.dumps({"status": "completed", "success_count": success, "skipped_count": skipped, "failed_songs": failed}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
