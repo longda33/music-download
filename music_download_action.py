@@ -606,8 +606,22 @@ def qq_search(title, artist):
     for row in rows[:3]:
         if not isinstance(row, dict) or not row.get("song_mid"):
             continue
+        row_title = str(row.get("song_title") or row.get("song_name") or "").strip()
+        row_artist = str(row.get("singer_name") or row.get("singer") or "").strip()
+        if canonical_title(row_title) != canonical_title(title):
+            continue
+        if canonical_artist(row_artist) != canonical_artist(artist):
+            continue
         detail = request_json(QQ_API, {"msg": f"{title} {artist}", "type": "json", "mid": row["song_mid"]}, SOURCE_HEADERS, timeout=DETAIL_TIMEOUT, retries=1)
-        source_title = str(detail.get("song_title") or detail.get("song_name") or row.get("song_title") or title).strip()
+        detail_title = str(detail.get("song_title") or detail.get("song_name") or "").strip()
+        detail_artist = str(detail.get("singer_name") or detail.get("singer") or "").strip()
+        if not detail_title or not detail_artist:
+            log(f"QQ 详情缺少歌曲名或歌手名，跳过：{row_title} - {row_artist}")
+            continue
+        source_title = detail_title
+        if canonical_title(source_title) != canonical_title(title) or canonical_artist(detail_artist) != canonical_artist(artist):
+            log(f"QQ 结果与目标不一致，跳过：{source_title} - {detail_artist}")
+            continue
         for tier, label in (("sq", "SQ"), ("pq", "PQ")):
             url = detail.get(f"song_play_url_{tier}")
             filename = detail.get(f"song_filename_{tier}")
@@ -664,10 +678,18 @@ def kuwo_search(title, artist):
             continue
         detail = request_json(KUWO_API, {"msg": query, "n": index, "br": 1}, SOURCE_HEADERS, timeout=DETAIL_TIMEOUT, retries=1)
         item = detail.get("data", {}) if isinstance(detail, dict) else {}
+        detail_title = str(item.get("song") or item.get("name") or "").strip() if isinstance(item, dict) else ""
+        detail_artist = str(item.get("singer") or item.get("artist") or "").strip() if isinstance(item, dict) else ""
+        if not detail_title or not detail_artist:
+            log(f"酷我详情缺少歌曲名或歌手名，跳过：{row.get('song')} - {row.get('singer')}")
+            continue
+        if canonical_title(detail_title) != canonical_title(title) or canonical_artist(detail_artist) != canonical_artist(artist):
+            log(f"酷我结果与目标不一致，跳过：{detail_title} - {detail_artist}")
+            continue
         url = item.get("url") if isinstance(item, dict) else ""
         fmt = str(item.get("format", "")).lower() if isinstance(item, dict) else ""
         if url and fmt == "flac" and str(url).lower().split("?")[0].endswith(".flac"):
-            return {"url": url, "filename": f"{title}.flac", "filename_title": str(item.get("song") or title).strip(), "size": size_bytes(item.get("size", "")), "source": "酷我", "quality": f"FLAC {item.get('bitrate', '2000')}kbps", "platform_ids": {"kuwo_id": item.get("id"), "kuwo_rid": item.get("rid") or row.get("rid")}}
+            return {"url": url, "filename": f"{title}.flac", "filename_title": detail_title, "size": size_bytes(item.get("size", "")), "source": "酷我", "quality": f"FLAC {item.get('bitrate', '2000')}kbps", "platform_ids": {"kuwo_id": item.get("id"), "kuwo_rid": item.get("rid") or row.get("rid")}}
     return None
 
 
