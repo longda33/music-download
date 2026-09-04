@@ -222,6 +222,23 @@ def query_terms(query):
     return [query]
 
 
+VERSION_MARKERS = (
+    "粤语", "国语", "普通话", "中文版", "粤语版", "国语版",
+    "live", "现场", "现场版", "伴奏", "纯音乐", "instrumental",
+    "remix", "dj版", "dj", "翻唱", "cover", "acoustic",
+)
+
+
+def is_title_variant(title, query):
+    """单项歌曲名批量搜索时，允许明确标注的同曲不同版本。"""
+    title_key = canonical_title(title)
+    query_key = canonical_title(query)
+    if title_key == query_key or not title_key.startswith(query_key):
+        return False
+    suffix = title_key[len(query_key):]
+    return any(marker in suffix for marker in VERSION_MARKERS)
+
+
 def normalize_folder_label(value):
     """生成稳定的文件夹名，消除括号、空格和全角字符造成的重复目录。"""
     text = unicodedata.normalize("NFKC", to_simplified(str(value or ""))).strip()
@@ -565,8 +582,9 @@ def discover_songs(mode, query):
                 # 单项搜索必须是歌曲名或歌手名完全匹配；
                 # 禁止“寂寞沙洲”匹配到“寂寞沙洲冷”等相似标题。
                 title_match = canonical_title(song.get("title", "")) == canonical_title(query)
+                version_match = is_title_variant(song.get("title", ""), query)
                 artist_match = canonical_artist(song.get("artist", "")) == canonical_artist(query)
-                if not (title_match or artist_match):
+                if not (title_match or version_match or artist_match):
                     continue
         artists = [{"artist": {"name": name.strip()}} for name in song["artist"].split(" & ") if name.strip()]
         if not song["title"] or not one_artist(artists):
