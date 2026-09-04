@@ -211,6 +211,17 @@ def canonical_title(value):
     return dedup_key(value)
 
 
+def query_terms(query):
+    """仅按明确的“+”分隔歌曲名和歌手名，避免空格造成歧义。"""
+    query = str(query or "").strip()
+    if "+" in query:
+        title, artist = query.split("+", 1)
+        title, artist = title.strip(), artist.strip()
+        if title and artist:
+            return [title, artist]
+    return [query]
+
+
 def normalize_folder_label(value):
     """生成稳定的文件夹名，消除括号、空格和全角字符造成的重复目录。"""
     text = unicodedata.normalize("NFKC", to_simplified(str(value or ""))).strip()
@@ -355,7 +366,8 @@ def identity_keys(song):
 def platform_discover(query):
     """从实时音源目录发现歌曲，不依赖 MusicBrainz 收录。"""
     candidates = []
-    parts = query.split()
+    parts = query_terms(query)
+    lookup_query = " ".join(parts)
     pair_terms = []
     if len(parts) >= 2:
         for cut in range(1, len(parts)):
@@ -384,7 +396,7 @@ def platform_discover(query):
                    for t, a in pair_terms)
 
     try:
-        rows = request_json(QQ_API, {"msg": query, "type": "json"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=1)
+        rows = request_json(QQ_API, {"msg": lookup_query, "type": "json"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=1)
         for row in rows if isinstance(rows, list) else []:
             title = row.get("song_title") or row.get("song_name")
             artist = row.get("singer_name")
@@ -394,7 +406,7 @@ def platform_discover(query):
         log(f"QQ 实时目录搜索失败：{exc}")
 
     try:
-        data = request_json(KUWO_API, {"msg": query, "page": 1, "limit": 100}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=1)
+        data = request_json(KUWO_API, {"msg": lookup_query, "page": 1, "limit": 100}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=1)
         rows = data.get("data", []) if isinstance(data, dict) else []
         for row in rows:
             title, artist = row.get("song"), row.get("singer")
@@ -404,7 +416,7 @@ def platform_discover(query):
         log(f"酷我实时目录搜索失败：{exc}")
 
     try:
-        data = request_json(NETEASE_API, {"type": "search", "id": query, "limit": 100, "page": 1, "server": "netease"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=1)
+        data = request_json(NETEASE_API, {"type": "search", "id": lookup_query, "limit": 100, "page": 1, "server": "netease"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=1)
         rows = data if isinstance(data, list) else []
         for row in rows:
             title, artist = row.get("name"), row.get("artist")
@@ -423,7 +435,7 @@ def platform_discover(query):
 
 def exact_pair_match(song, query):
     """校验双项命令，防止模糊搜索把相似歌名当成目标歌曲。"""
-    parts = query.split()
+    parts = query_terms(query)
     if len(parts) < 2:
         return True
     title = canonical_title(song.get("title", ""))
@@ -437,6 +449,7 @@ def exact_pair_match(song, query):
 
 def discover_songs(mode, query):
     songs = []
+    lookup_query = " ".join(query_terms(query))
     if mode == "search":
         songs.extend(platform_discover(query))
         log(f"实时音源目录初步发现：{len(songs)} 首")
@@ -461,8 +474,8 @@ def discover_songs(mode, query):
                     if len(rows) < 100:
                         break
         elif mode == "search":
-            # 两个搜索项=歌曲+歌手，只下载一首；一个搜索项=宽搜，全部下载。
-            parts = query.split()
+            # 使用“歌曲名+歌手名”时只下载一首；不含“+”时按完整歌曲名搜索。
+            parts = query_terms(query)
             if len(parts) == 1:
                 # 单项可能是歌手名：优先抓取该艺人的完整目录。
                 artist_found = mb_get("artist", {"query": f'artist:"{query}"', "limit": 5})
@@ -508,7 +521,7 @@ def discover_songs(mode, query):
                     if songs:
                         break
             try:
-                data = lastfm_get("track.search", {"track": query, "limit": 20, "page": 1})
+                data = lastfm_get("track.search", {"track": lookup_query, "limit": 20, "page": 1})
                 for row in data.get("results", {}).get("trackmatches", {}).get("track", []):
                     item = lastfm_recording(row)
                     if item:
@@ -531,7 +544,7 @@ def discover_songs(mode, query):
             data = lastfm_get("artist.getTopTracks", {"artist": query, "limit": 100, "page": 1, "autocorrect": 1})
             rows = data.get("toptracks", {}).get("track", [])
         else:
-            data = lastfm_get("track.search", {"track": query, "limit": 100, "page": 1})
+            data = lastfm_get("track.search", {"track": lookup_query, "limit": 100, "page": 1})
             rows = data.get("results", {}).get("trackmatches", {}).get("track", [])
         for row in rows:
             item = lastfm_recording(row)
@@ -544,7 +557,7 @@ def discover_songs(mode, query):
     result = []
     for song in songs:
         if mode == "search":
-            parts = query.split()
+            parts = query_terms(query)
             if len(parts) >= 2:
                 if not song.pop("_gemini_match", False) and not exact_pair_match(song, query):
                     continue
@@ -1005,7 +1018,7 @@ def main():
         fail("缺少 query")
     log(f"开始任务：mode={mode}, query={query}")
     songs = discover_songs(mode, query)
-    if mode == "search" and len(query.split()) >= 2:
+    if mode == "search" and len(query_terms(query)) >= 2:
         songs = songs[:1]
     log(f"目录检索完成：共 {len(songs)} 首，三人及以上合唱已过滤")
     if not songs:
@@ -1042,7 +1055,7 @@ def main():
         # 歌手搜索及“歌曲名+歌手名”搜索仍按歌手分文件夹。
         single_title_search = (
             mode == "search"
-            and len(query.split()) == 1
+            and len(query_terms(query)) == 1
             and canonical_title(original.get("title", "")) == canonical_title(query)
         )
         artist_folder = ""
