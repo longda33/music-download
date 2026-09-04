@@ -1082,7 +1082,8 @@ def main():
         artist_folder = ""
         if not single_title_search:
             artist_folder = safe_name(artist_folder_name(found["artist"], original.get("artist")))
-        target_folder = safe_name(normalize_folder_label(original.get("title") or filename_title)) if single_title_search else artist_folder
+        folder_label = query if single_title_search else (original.get("title") or filename_title)
+        target_folder = safe_name(normalize_folder_label(folder_label)) if single_title_search else artist_folder
         ensure_alist_folder(auth, target_folder)
         log(f"[{index}/{len(songs)}] 目标文件夹：{target_folder}")
         base_filename = safe_name(f"{filename_title} {original['artist']}.flac")
