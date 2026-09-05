@@ -413,14 +413,17 @@ def platform_discover(query):
             pair_terms.extend([(left, right), (right, left)])
 
     def exact_accept(title, artist):
+        """歌曲名-歌手名按艺人精确匹配，并允许同曲的明确版本。"""
         title, artist = str(title or "").strip(), str(artist or "").strip()
         if not title or not artist:
             return False
         if len(parts) == 1:
             return True
-        return any(canonical_title(title) == canonical_title(t)
-                   and canonical_artist(artist) == canonical_artist(a)
-                   for t, a in pair_terms)
+        return any(
+            canonical_artist(artist) == canonical_artist(a)
+            and (canonical_title(title) == canonical_title(t) or is_title_variant(title, t))
+            for t, a in pair_terms
+        )
 
     def accept(title, artist):
         """GitHub Action 初筛：至少标题或艺人命中，剩余交给 Gemini。"""
@@ -480,7 +483,10 @@ def exact_pair_match(song, query):
     artist = canonical_artist(song.get("artist", ""))
     for cut in range(1, len(parts)):
         left, right = " ".join(parts[:cut]), " ".join(parts[cut:])
-        if (title == canonical_title(left) and artist == canonical_artist(right)) or (title == canonical_title(right) and artist == canonical_artist(left)):
+        if ((artist == canonical_artist(right)
+             and (title == canonical_title(left) or is_title_variant(song.get("title", ""), left)))
+                or (artist == canonical_artist(left)
+                    and (title == canonical_title(right) or is_title_variant(song.get("title", ""), right)))):
             return True
     return False
 
@@ -1079,9 +1085,7 @@ def main():
         fail("缺少 query")
     log(f"开始任务：mode={mode}, query={query}")
     songs = discover_songs(mode, query)
-    if mode == "search" and len(query_terms(query)) >= 2:
-        songs = songs[:1]
-    log(f"目录检索完成：共 {len(songs)} 首，三人及以上合唱已过滤")
+    log(f"目录检索完成：共 {len(songs)} 首，歌曲名-歌手名支持同曲 Live、现场、伴奏、Remix 等明确版本，三人及以上合唱已过滤")
     if not songs:
         message = "未搜索到歌曲，请检查输入的歌曲名称或歌手名称是否正确。"
         log(message)
