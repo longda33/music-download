@@ -274,6 +274,20 @@ def normalize_folder_label(value):
     return text or "unknown"
 
 
+def parse_gemini_json(text):
+    """从 Gemini 返回文本中提取第一个 JSON 对象，兼容 Markdown 和尾部说明。"""
+    raw = str(text or "").strip()
+    if raw.startswith("```"):
+        raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.IGNORECASE | re.DOTALL).strip()
+    start = raw.find("{")
+    if start < 0:
+        raise ValueError("Gemini 返回中没有 JSON 对象")
+    result, _ = json.JSONDecoder().raw_decode(raw[start:])
+    if not isinstance(result, dict):
+        raise ValueError("Gemini 返回的 JSON 不是对象")
+    return result
+
+
 def gemini_artist_alias(value, related=None):
     """用 Gemini 判断两个艺人名称是否同一身份，并选择稳定名称。"""
     global GEMINI_RATE_LIMITED
@@ -316,7 +330,7 @@ def gemini_artist_alias(value, related=None):
         response.raise_for_status()
         data = response.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"]
-        result = json.loads(text)
+        result = parse_gemini_json(text)
         canonical = normalize_folder_label(result.get("canonical_name") or raw)
         confidence = float(result.get("confidence") or 0)
         if not result.get("same_artist") or confidence < 0.90:
@@ -326,7 +340,11 @@ def gemini_artist_alias(value, related=None):
             log(f"Gemini 艺人别名识别：{raw} → {canonical}（置信度 {confidence:.2f}）")
         return canonical
     except Exception as exc:
-        log(f"Gemini 艺人别名识别跳过：{exc}")
+        if "HTTP 429" in str(exc):
+            GEMINI_RATE_LIMITED = True
+            log("Gemini API 达到频率/配额限制，本次任务关闭后续 AI 判断，回退本地规则")
+        else:
+            log(f"Gemini 艺人别名识别跳过：{exc}")
         GEMINI_ARTIST_CACHE[cache_key] = raw
         return raw
 
@@ -378,7 +396,7 @@ def gemini_batch_filter(query, candidates):
             log("Gemini API 达到频率/配额限制，本次任务关闭 AI 批量筛选，回退本地结果")
             return set()
         response.raise_for_status()
-        result = json.loads(response.json()["candidates"][0]["content"]["parts"][0]["text"])
+        result = parse_gemini_json(response.json()["candidates"][0]["content"]["parts"][0]["text"])
         matched = {int(item["index"]) for item in result.get("matches", [])
                    if isinstance(item, dict) and float(item.get("confidence") or 0) >= 0.92
                    and 0 <= int(item.get("index", -1)) < len(candidates)}
@@ -386,7 +404,11 @@ def gemini_batch_filter(query, candidates):
         log(f"Gemini 批量歌曲别名筛选：输入 {len(candidates)} 首，匹配 {len(matched)} 首")
         return matched
     except Exception as exc:
-        log(f"Gemini 批量歌曲别名筛选跳过：{exc}")
+        if "HTTP 429" in str(exc):
+            GEMINI_RATE_LIMITED = True
+            log("Gemini API 达到频率/配额限制，本次任务关闭 AI 批量筛选，回退本地结果")
+        else:
+            log(f"Gemini 批量歌曲别名筛选跳过：{exc}")
         GEMINI_BATCH_CACHE[cache_key] = set()
         return set()
 
