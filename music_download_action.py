@@ -42,6 +42,7 @@ LASTFM_API = "https://ws.audioscrobbler.com/2.0/"
 GEMINI_API = "https://generativelanguage.googleapis.com/v1beta/models"
 SOURCE_HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*"}
 RETRIES = 3
+RETRY_INTERVAL = 10
 SOURCE_TIMEOUT = 12
 DETAIL_TIMEOUT = 8
 SIZE_TOLERANCE = 3 * 1024 * 1024
@@ -69,17 +70,37 @@ def fail(message):
     raise RuntimeError(message)
 
 
+def http_request(method, url, **kwargs):
+    """所有 HTTP 请求统一最多尝试 3 次，失败间隔 10 秒。"""
+    retry_count = kwargs.pop("_retry_count", RETRIES)
+    error = None
+    for attempt in range(1, retry_count + 1):
+        try:
+            response = requests.request(method, url, **kwargs)
+            status = getattr(response, "status_code", 0)
+            if status == 429 or status >= 500:
+                response.close()
+                raise RuntimeError(f"HTTP {status}")
+            return response
+        except Exception as exc:
+            error = exc
+            if attempt < retry_count:
+                time.sleep(RETRY_INTERVAL)
+    raise error
+
+
 def request_json(url, params=None, headers=None, timeout=60, retries=RETRIES):
     error = None
-    for attempt in range(retries):
+    for attempt in range(1, retries + 1):
         try:
-            r = requests.get(url, params=params, headers=headers, timeout=timeout)
+            # JSON 解析/HTTP 状态失败也应重试，但避免与底层 HTTP 重试叠加。
+            r = http_request("GET", url, params=params, headers=headers, timeout=timeout, _retry_count=1)
             r.raise_for_status()
             return r.json()
         except Exception as exc:
             error = exc
-            if attempt + 1 < RETRIES:
-                time.sleep(2 ** attempt)
+            if attempt < retries:
+                time.sleep(RETRY_INTERVAL)
     raise RuntimeError(f"请求失败 {url}: {error}")
 
 
@@ -111,7 +132,7 @@ def lastfm_get(method, params):
     if not api_key:
         fail("缺少 LASTFM_API_KEY")
     query = {"method": method, "api_key": api_key, "format": "json", **params}
-    r = requests.get(LASTFM_API, params=query, timeout=30)
+    r = http_request("GET", LASTFM_API, params=query, timeout=30)
     r.raise_for_status()
     data = r.json()
     if data.get("error"):
@@ -281,7 +302,7 @@ def gemini_artist_alias(value, related=None):
         "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
     }
     try:
-        response = requests.post(
+        response = http_request("POST", 
             f"{GEMINI_API}/{model}:generateContent",
             headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
             json=body,
@@ -332,7 +353,7 @@ def gemini_batch_filter(query, candidates):
         f"候选列表：{json.dumps(items, ensure_ascii=False)}"
     )
     try:
-        response = requests.post(
+        response = http_request("POST", 
             f"{GEMINI_API}/{model}:generateContent",
             headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
             json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0, "responseMimeType": "application/json"}},
@@ -413,7 +434,7 @@ def platform_discover(query):
                    for t, a in pair_terms)
 
     try:
-        rows = request_json(QQ_API, {"msg": lookup_query, "type": "json"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=1)
+        rows = request_json(QQ_API, {"msg": lookup_query, "type": "json"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=RETRIES)
         for row in rows if isinstance(rows, list) else []:
             title = row.get("song_title") or row.get("song_name")
             artist = row.get("singer_name")
@@ -423,7 +444,7 @@ def platform_discover(query):
         log(f"QQ 实时目录搜索失败：{exc}")
 
     try:
-        data = request_json(KUWO_API, {"msg": lookup_query, "page": 1, "limit": 100}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=1)
+        data = request_json(KUWO_API, {"msg": lookup_query, "page": 1, "limit": 100}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=RETRIES)
         rows = data.get("data", []) if isinstance(data, dict) else []
         for row in rows:
             title, artist = row.get("song"), row.get("singer")
@@ -433,7 +454,7 @@ def platform_discover(query):
         log(f"酷我实时目录搜索失败：{exc}")
 
     try:
-        data = request_json(NETEASE_API, {"type": "search", "id": lookup_query, "limit": 100, "page": 1, "server": "netease"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=1)
+        data = request_json(NETEASE_API, {"type": "search", "id": lookup_query, "limit": 100, "page": 1, "server": "netease"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=RETRIES)
         rows = data if isinstance(data, list) else []
         for row in rows:
             title, artist = row.get("name"), row.get("artist")
@@ -600,7 +621,7 @@ def discover_songs(mode, query):
 
 
 def qq_search(title, artist):
-    rows = request_json(QQ_API, {"msg": f"{title} {artist}", "type": "json"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=1)
+    rows = request_json(QQ_API, {"msg": f"{title} {artist}", "type": "json"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=RETRIES)
     if not isinstance(rows, list):
         return None
     for row in rows[:3]:
@@ -612,7 +633,7 @@ def qq_search(title, artist):
             continue
         if canonical_artist(row_artist) != canonical_artist(artist):
             continue
-        detail = request_json(QQ_API, {"msg": f"{title} {artist}", "type": "json", "mid": row["song_mid"]}, SOURCE_HEADERS, timeout=DETAIL_TIMEOUT, retries=1)
+        detail = request_json(QQ_API, {"msg": f"{title} {artist}", "type": "json", "mid": row["song_mid"]}, SOURCE_HEADERS, timeout=DETAIL_TIMEOUT, retries=RETRIES)
         detail_title = str(detail.get("song_title") or detail.get("song_name") or "").strip()
         detail_artist = str(detail.get("singer_name") or detail.get("singer") or "").strip()
         if not detail_title or not detail_artist:
@@ -649,7 +670,7 @@ def recursive_flac(value):
 def kuwo_search(title, artist):
     # 酷我 HAR：先搜索，再用 msg+n+br=1 获取真实无损地址。
     query = f"{title} {artist}"
-    data = request_json(KUWO_API, {"msg": query, "page": 1, "limit": 10}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=1)
+    data = request_json(KUWO_API, {"msg": query, "page": 1, "limit": 10}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=RETRIES)
     rows = data.get("data", []) if isinstance(data, dict) else []
     if not isinstance(rows, list):
         return None
@@ -676,7 +697,7 @@ def kuwo_search(title, artist):
         )
         if not has_flac:
             continue
-        detail = request_json(KUWO_API, {"msg": query, "n": index, "br": 1}, SOURCE_HEADERS, timeout=DETAIL_TIMEOUT, retries=1)
+        detail = request_json(KUWO_API, {"msg": query, "n": index, "br": 1}, SOURCE_HEADERS, timeout=DETAIL_TIMEOUT, retries=RETRIES)
         item = detail.get("data", {}) if isinstance(detail, dict) else {}
         detail_title = str(item.get("song") or item.get("name") or "").strip() if isinstance(item, dict) else ""
         detail_artist = str(item.get("singer") or item.get("artist") or "").strip() if isinstance(item, dict) else ""
@@ -694,7 +715,7 @@ def kuwo_search(title, artist):
 
 
 def netease_search(title, artist):
-    data = request_json(NETEASE_API, {"type": "search", "id": f"{title} {artist}", "limit": 10, "page": 1, "server": "netease"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=1)
+    data = request_json(NETEASE_API, {"type": "search", "id": f"{title} {artist}", "limit": 10, "page": 1, "server": "netease"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=RETRIES)
     for row in (data if isinstance(data, list) else []):
         row_title, row_artist = row.get("name", ""), row.get("artist", "")
         if canonical_title(row_title) != canonical_title(title) or canonical_artist(row_artist) != canonical_artist(artist):
@@ -706,7 +727,7 @@ def netease_search(title, artist):
         # 搜索和下载接口分开：明确请求网易云无损档位 br=2000。
         download_url = f"{NETEASE_API}?server=netease&type=url&id={song_id}&br=2000"
         try:
-            probe = requests.get(download_url, headers=SOURCE_HEADERS, timeout=60, allow_redirects=True, stream=True)
+            probe = http_request("GET", download_url, headers=SOURCE_HEADERS, timeout=60, allow_redirects=True, stream=True)
             content_type = probe.headers.get("content-type", "").lower()
             is_flac = ".flac" in probe.url.lower() or "audio/flac" in content_type or "audio/x-flac" in content_type
             size = int(probe.headers.get("content-length", 0) or 0)
@@ -748,7 +769,7 @@ def netease_metadata(title, artist):
                 {"type": "search", "id": search_text, "limit": 30, "page": 1, "server": "netease"},
                 SOURCE_HEADERS,
                 timeout=SOURCE_TIMEOUT,
-                retries=1,
+                retries=RETRIES,
             )
             for row in rows if isinstance(rows, list) else []:
                 row_title = str(row.get("name") or "").strip()
@@ -782,7 +803,7 @@ def netease_metadata(title, artist):
         lyric_url = str(selected.get("lrc") or "").strip()
         lyrics = ""
         if lyric_url:
-            lyric = requests.get(lyric_url, headers=SOURCE_HEADERS, timeout=DETAIL_TIMEOUT)
+            lyric = http_request("GET", lyric_url, headers=SOURCE_HEADERS, timeout=DETAIL_TIMEOUT)
             if lyric.ok:
                 lyrics = simplify_chinese_lyrics(lyric.text, title, artist)
         suffix = "歌手精确匹配" if canonical_artist(row_artist) == canonical_artist(artist) else "歌曲名唯一匹配"
@@ -816,7 +837,7 @@ def embed_metadata(local_path, song):
         if netease.get("lyrics"):
             audio["lyrics"] = [netease["lyrics"]]
         if netease.get("cover_url"):
-            cover = requests.get(netease["cover_url"], headers=SOURCE_HEADERS, timeout=30)
+            cover = http_request("GET", netease["cover_url"], headers=SOURCE_HEADERS, timeout=30)
             cover.raise_for_status()
             picture = Picture()
             picture.type = 3
@@ -846,7 +867,7 @@ def embed_metadata(local_path, song):
                 if cover_urls and not netease.get("cover_url"):
                     cover = None
                     for cover_url in cover_urls:
-                        candidate = requests.get(cover_url, headers=SOURCE_HEADERS, timeout=30)
+                        candidate = http_request("GET", cover_url, headers=SOURCE_HEADERS, timeout=30)
                         if candidate.status_code == 404:
                             continue
                         candidate.raise_for_status()
@@ -872,7 +893,7 @@ def embed_metadata(local_path, song):
         # LRCLIB 作为网易云无歌词时的补充。
         if not netease.get("lyrics"):
             try:
-                lyric = requests.get("https://lrclib.net/api/get", params={"track_name": title, "artist_name": artist}, timeout=30)
+                lyric = http_request("GET", "https://lrclib.net/api/get", params={"track_name": title, "artist_name": artist}, timeout=30)
                 if lyric.status_code == 200:
                     lyric_data = lyric.json()
                     lyrics = lyric_data.get("syncedLyrics") or lyric_data.get("plainLyrics")
@@ -935,7 +956,7 @@ def alist_api(auth, endpoint):
 
 def ensure_alist_folder(auth, subfolder=None):
     path = alist_file_path(subfolder=subfolder)
-    r = requests.post(alist_api(auth, "mkdir"), headers=alist_headers(auth, {"Content-Type": "application/json"}), json={"path": path}, timeout=60)
+    r = http_request("POST", alist_api(auth, "mkdir"), headers=alist_headers(auth, {"Content-Type": "application/json"}), json={"path": path}, timeout=60)
     if r.status_code >= 400:
         try:
             data = r.json()
@@ -948,7 +969,7 @@ def ensure_alist_folder(auth, subfolder=None):
 
 def alist_listing(auth, subfolder=None):
     path = alist_file_path(subfolder=subfolder)
-    r = requests.post(alist_api(auth, "list"), headers=alist_headers(auth, {"Content-Type": "application/json"}), json={"path": path, "password": "", "page": 1, "per_page": 1000, "refresh": True}, timeout=60)
+    r = http_request("POST", alist_api(auth, "list"), headers=alist_headers(auth, {"Content-Type": "application/json"}), json={"path": path, "password": "", "page": 1, "per_page": 1000, "refresh": True}, timeout=60)
     r.raise_for_status()
     data = r.json()
     if data.get("code") != 200:
@@ -995,7 +1016,7 @@ def upload(auth, local_path, filename, subfolder=None):
     encoded_path = quote(path, safe="/")
     headers = alist_headers(auth, {"File-Path": encoded_path, "Content-Length": str(expected), "Content-Type": "audio/flac", "As-Task": "false"})
     with local_path.open("rb") as handle:
-        r = requests.put(alist_api(auth, "put"), headers=headers, data=handle, timeout=600)
+        r = http_request("PUT", alist_api(auth, "put"), headers=headers, data=handle, timeout=600)
     try:
         data = r.json()
     except ValueError as exc:
@@ -1006,7 +1027,7 @@ def upload(auth, local_path, filename, subfolder=None):
         last_observed = None
         for attempt in range(3):
             if attempt:
-                time.sleep(5)
+                time.sleep(RETRY_INTERVAL)
             try:
                 files = alist_listing(auth, subfolder=subfolder)
                 last_observed = files.get(filename)
@@ -1043,7 +1064,7 @@ def callback(payload):
         "failed_songs": payload.get("failed_songs", []),
         "error": payload.get("error", ""),
     }
-    requests.post(url, headers=headers, json=result, timeout=30).raise_for_status()
+    http_request("POST", url, headers=headers, json=result, timeout=30).raise_for_status()
 
 
 def main():
@@ -1111,7 +1132,7 @@ def main():
         base_filename = safe_name(f"{filename_title} {original['artist']}.flac")
         local = work / base_filename
         try:
-            r = requests.get(found["url"], headers=SOURCE_HEADERS, stream=True, timeout=300)
+            r = http_request("GET", found["url"], headers=SOURCE_HEADERS, stream=True, timeout=300)
             r.raise_for_status()
             total = int(r.headers.get("content-length", 0) or found.get("size", 0) or 0)
             downloaded = 0

@@ -37,6 +37,7 @@ MAX_DOWNLOAD_DELAY = 1.5
 
 # 最大重试
 MAX_RETRY = 3
+RETRY_INTERVAL = 10
 
 # HTTP 超时
 CONNECT_TIMEOUT = 10
@@ -119,12 +120,7 @@ def download_delay():
     """
     下载请求之间稍微等待。
     """
-    time.sleep(
-        random.uniform(
-            MIN_DOWNLOAD_DELAY,
-            MAX_DOWNLOAD_DELAY
-        )
-    )
+    time.sleep(RETRY_INTERVAL)
 
 
 def safe_filename(name):
@@ -328,10 +324,7 @@ def get_json(
 
             if attempt < MAX_RETRY:
 
-                wait = min(
-                    60,
-                    5 * (2 ** (attempt - 1))
-                )
+                wait = RETRY_INTERVAL
 
                 logger.info(
                     "%.0f 秒后重试",
@@ -1178,10 +1171,7 @@ def download_file(
 
             if attempt < MAX_RETRY:
 
-                wait = min(
-                    60,
-                    5 * (2 ** (attempt - 1))
-                )
+                wait = RETRY_INTERVAL
 
                 time.sleep(wait)
 
