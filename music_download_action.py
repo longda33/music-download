@@ -1122,6 +1122,7 @@ def callback(payload):
         "success_count": payload.get("success_count", 0),
         "skipped_count": payload.get("skipped_count", 0),
         "failed_songs": payload.get("failed_songs", []),
+        "failed_details": payload.get("failed_details", []),
         "error": payload.get("error", ""),
     }
     http_request("POST", url, headers=headers, json=result, timeout=30).raise_for_status()
@@ -1148,9 +1149,10 @@ def main():
         payload["success_count"] = 0
         payload["skipped_count"] = 0
         payload["failed_songs"] = []
+        payload["failed_details"] = []
         payload["error"] = message
         callback(payload)
-        print(json.dumps({"status": "no_results", "success_count": 0, "skipped_count": 0, "failed_songs": [], "error": message}, ensure_ascii=False))
+        print(json.dumps({"status": "no_results", "success_count": 0, "skipped_count": 0, "failed_songs": [], "failed_details": [], "error": message}, ensure_ascii=False))
         return
     auth = alist_auth()
     ensure_alist_folder(auth)
@@ -1160,6 +1162,7 @@ def main():
     success = 0
     skipped = 0
     failed = []
+    failed_details = []
     for index, original in enumerate(songs, 1):
         label = f"{original['title']} - {original['artist']}"
         log(f"[{index}/{len(songs)}] 搜索音源：{label}")
@@ -1167,6 +1170,13 @@ def main():
         if not found:
             log(f"[{index}/{len(songs)}] 失败：三个音源都没有可用 FLAC")
             failed.append(label)
+            failed_details.append({
+                "title": original.get("title", ""),
+                "artist": original.get("artist", ""),
+                "stage": "source_resolution",
+                "source": "QQ/网易云/酷我",
+                "error": "三个音源都没有找到可用 FLAC 下载地址",
+            })
             continue
         log(f"[{index}/{len(songs)}] 找到音源：{found['source']} {found.get('quality', 'FLAC')}")
         filename_title = safe_name(str(found.get("filename_title") or original["title"]).strip())
@@ -1189,6 +1199,7 @@ def main():
         log(f"[{index}/{len(songs)}] 目标文件夹：{target_folder}")
         base_filename = safe_name(f"{filename_title} {original['artist']}.flac")
         local = work / base_filename
+        stage = "download"
         try:
             r = http_request("GET", found["url"], headers=SOURCE_HEADERS, stream=True, timeout=300)
             r.raise_for_status()
@@ -1212,14 +1223,17 @@ def main():
             log(f"[{index}/{len(songs)}] 下载完成：{actual / 1048576:.2f} MiB，上传前检查 AList 目录文件")
             if found["size"] and abs(actual - found["size"]) > SIZE_TOLERANCE:
                 raise RuntimeError(f"体积异常 {actual}/{found['size']}")
+            stage = "metadata"
             embed_metadata(local, found)
             actual = local.stat().st_size
+            stage = "alist_listing"
             filename = choose_filename(auth, base_filename, actual, subfolder=target_folder)
             if filename is None:
                 local.unlink(missing_ok=True)
                 skipped += 1
                 log(f"[{index}/{len(songs)}] 跳过：AList 已存在相同文件")
                 continue
+            stage = "upload"
             upload(auth, local, filename, subfolder=target_folder)
             local.unlink(missing_ok=True)
             success += 1
@@ -1227,15 +1241,23 @@ def main():
         except Exception as exc:
             local.unlink(missing_ok=True)
             failed.append(label)
-            log(f"[{index}/{len(songs)}] 失败：{exc}")
+            failed_details.append({
+                "title": original.get("title", ""),
+                "artist": original.get("artist", ""),
+                "stage": stage,
+                "source": found.get("source", "unknown"),
+                "error": str(exc),
+            })
+            log(f"[{index}/{len(songs)}] 失败：阶段={stage}，音源={found.get('source', 'unknown')}，原因={exc}")
     log(f"任务完成：上传 {success} 首，跳过 {skipped} 首，失败 {len(failed)} 首")
     payload["success_count"] = success
     payload["skipped_count"] = skipped
     payload["failed_songs"] = failed
+    payload["failed_details"] = failed_details
     payload["status"] = "completed"
     payload["cancelled"] = False
     callback(payload)
-    print(json.dumps({"status": "completed", "success_count": success, "skipped_count": skipped, "failed_songs": failed}, ensure_ascii=False))
+    print(json.dumps({"status": "completed", "success_count": success, "skipped_count": skipped, "failed_songs": failed, "failed_details": failed_details}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
@@ -1250,6 +1272,7 @@ if __name__ == "__main__":
             ACTIVE_PAYLOAD["error"] = message
             ACTIVE_PAYLOAD.setdefault("success_count", 0)
             ACTIVE_PAYLOAD.setdefault("failed_songs", [])
+            ACTIVE_PAYLOAD.setdefault("failed_details", [{"title": "", "artist": "", "stage": "task", "source": "", "error": message}])
             try:
                 callback(ACTIVE_PAYLOAD)
                 log("异常状态已回调 n8n")
