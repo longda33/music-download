@@ -331,6 +331,20 @@ def gemini_artist_alias(value, related=None):
         return raw
 
 
+def artists_match(left, right):
+    """先本地精确匹配，失败后用 Gemini 判断艺人别名。"""
+    left, right = str(left or "").strip(), str(right or "").strip()
+    if not left or not right:
+        return False
+    if canonical_artist(left) == canonical_artist(right):
+        return True
+    if not os.getenv("GEMINI_API_KEY"):
+        return False
+    left_canonical = normalize_folder_label(gemini_artist_alias(left, right))
+    right_canonical = normalize_folder_label(gemini_artist_alias(right, left))
+    return left_canonical.casefold() == right_canonical.casefold()
+
+
 def gemini_batch_filter(query, candidates):
     """一次性判断本地初筛后的候选，返回可接受的候选序号。"""
     global GEMINI_RATE_LIMITED
@@ -420,7 +434,7 @@ def platform_discover(query):
         if len(parts) == 1:
             return True
         return any(
-            canonical_artist(artist) == canonical_artist(a)
+            artists_match(artist, a)
             and (canonical_title(title) == canonical_title(t) or is_title_variant(title, t))
             for t, a in pair_terms
         )
@@ -480,13 +494,31 @@ def exact_pair_match(song, query):
     if len(parts) < 2:
         return True
     title = canonical_title(song.get("title", ""))
-    artist = canonical_artist(song.get("artist", ""))
+    artist = str(song.get("artist", ""))
     for cut in range(1, len(parts)):
         left, right = " ".join(parts[:cut]), " ".join(parts[cut:])
-        if ((artist == canonical_artist(right)
+        if ((artists_match(artist, right)
              and (title == canonical_title(left) or is_title_variant(song.get("title", ""), left)))
-                or (artist == canonical_artist(left)
+                or (artists_match(artist, left)
                     and (title == canonical_title(right) or is_title_variant(song.get("title", ""), right)))):
+            return True
+    return False
+
+
+def space_pair_match(song, query):
+    """兼容“歌曲名 歌手名”输入，同时允许歌曲名带明确版本。"""
+    raw_parts = [part for part in re.split(r"\s+", str(query or "").strip()) if part]
+    if len(raw_parts) < 2:
+        return False
+    title = str(song.get("title", ""))
+    artist = str(song.get("artist", ""))
+    for cut in range(1, len(raw_parts)):
+        left = " ".join(raw_parts[:cut])
+        right = " ".join(raw_parts[cut:])
+        if ((artists_match(artist, right)
+             and (canonical_title(title) == canonical_title(left) or is_title_variant(title, left)))
+                or (artists_match(artist, left)
+                    and (canonical_title(title) == canonical_title(right) or is_title_variant(title, right)))):
             return True
     return False
 
@@ -611,7 +643,7 @@ def discover_songs(mode, query):
                 title_match = canonical_title(song.get("title", "")) == canonical_title(query)
                 version_match = is_title_variant(song.get("title", ""), query)
                 artist_match = canonical_artist(song.get("artist", "")) == canonical_artist(query)
-                if not (title_match or version_match or artist_match):
+                if not (title_match or version_match or artist_match or space_pair_match(song, query)):
                     continue
         artists = [{"artist": {"name": name.strip()}} for name in song["artist"].split(" & ") if name.strip()]
         if not song["title"] or not one_artist(artists):
