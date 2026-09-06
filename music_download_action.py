@@ -113,7 +113,7 @@ def artist_credit_info(credit):
         if name and name not in names:
             names.append(name)
             ids.append(artist_id or "")
-    if not 1 <= len(names) <= 2:
+    if not 1 <= len(names) <= 4:
         return None, []
     return " & ".join(names), [x for x in ids if x]
 
@@ -473,6 +473,15 @@ def platform_discover(query):
                    for t, a in pair_terms)
 
     try:
+        for row in qq_primary_discover(lookup_query):
+            title, artist = row.get("title"), row.get("artist")
+            if accept(title, artist):
+                row["_exact_match"] = exact_accept(title, artist)
+                candidates.append(row)
+    except Exception as exc:
+        log(f"新 QQ 实时目录搜索失败：{exc}")
+
+    try:
         rows = request_json(QQ_API, {"msg": lookup_query, "type": "json"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=RETRIES)
         for row in rows if isinstance(rows, list) else []:
             title = row.get("song_title") or row.get("song_name")
@@ -680,7 +689,84 @@ def discover_songs(mode, query):
     return result
 
 
+def qq_primary_result(query, index=1):
+    """新 QQ 接口：通过 n 获取第 index 条 SQ 结果；不使用旧 QQ 参数。"""
+    data = request_json(
+        "https://a.aa.cab/qq.music",
+        {"msg": query, "n": index, "type": 4},
+        SOURCE_HEADERS,
+        timeout=SOURCE_TIMEOUT,
+        retries=RETRIES,
+    )
+    if not isinstance(data, dict) or data.get("code") != 0:
+        return None
+    row = data.get("data")
+    return row if isinstance(row, dict) else None
+
+
+def qq_primary_search(title, artist, index=1):
+    """优先使用新 QQ 接口，精确获取指定结果的 SQ 无损地址。"""
+    query = f"{title} {artist}"
+    row = qq_primary_result(query, index)
+    if not row:
+        return None
+    row_title = str(row.get("song") or row.get("song_name") or "").strip()
+    row_artist = str(row.get("singer") or row.get("artist") or "").strip()
+    music = str(row.get("music") or row.get("url") or "").strip()
+    artist_parts = [part.strip() for part in re.split(r"[,，/&、]+", row_artist) if part.strip()]
+    if (canonical_title(row_title) != canonical_title(title)
+            or not any(artists_match(part, artist) for part in artist_parts)
+            or not music):
+        return None
+    if not music.lower().split("?")[0].endswith(".flac"):
+        return None
+    return {
+        "url": music,
+        "filename": f"{row_title} {row_artist}.flac",
+        "filename_title": row_title,
+        "size": int(row.get("size") or 0),
+        "source": "QQ新接口",
+        "quality": "SQ无损",
+        "platform_ids": {
+            "qq_primary_mid": row.get("mid"),
+            "qq_primary_media_mid": row.get("media_mid"),
+            "qq_primary_album_mid": row.get("album_mid"),
+        },
+    }
+
+
+def qq_primary_discover(query):
+    """新 QQ 接口搜索：按参考接口使用 msg+num，一次最多返回 60 条。"""
+    data = request_json(
+        "https://a.aa.cab/qq.music",
+        {"msg": query, "num": 60},
+        SOURCE_HEADERS,
+        timeout=SOURCE_TIMEOUT,
+        retries=RETRIES,
+    )
+    if not isinstance(data, dict) or data.get("code") != 0:
+        return []
+    raw = data.get("data")
+    rows = raw if isinstance(raw, list) else []
+    result = []
+    seen = set()
+    for position, row in enumerate(rows, 1):
+        if not isinstance(row, dict):
+            continue
+        title = str(row.get("song") or row.get("song_name") or "").strip()
+        artist = str(row.get("singer") or row.get("artist") or "").strip()
+        mid = str(row.get("mid") or row.get("media_mid") or "")
+        key = (canonical_title(title), canonical_artist(artist), mid)
+        if not title or not artist or key in seen:
+            continue
+        seen.add(key)
+        index = int(row.get("num") or position)
+        result.append({"title": title, "artist": artist, "platform_ids": {"qq_primary_n": index, "qq_primary_mid": row.get("mid"), "qq_primary_media_mid": row.get("media_mid"), "qq_primary_album_mid": row.get("album_mid")}, "artist_ids": [], "recording_id": None, "isrc": None, "year": None})
+    return result
+
+
 def qq_search(title, artist):
+    """旧 QQ 接口适配器：保持原有 type=json、song_mid 详情请求不变。"""
     rows = request_json(QQ_API, {"msg": f"{title} {artist}", "type": "json"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=RETRIES)
     if not isinstance(rows, list):
         return None
@@ -801,9 +887,13 @@ def netease_search(title, artist):
 
 def find_source(song):
     found = []
-    for func in (qq_search, kuwo_search, netease_search):
+    for func in (qq_primary_search, qq_search, netease_search, kuwo_search):
         try:
-            item = func(song["title"], song["artist"])
+            if func is qq_primary_search:
+                index = int((song.get("platform_ids") or {}).get("qq_primary_n") or 1)
+                item = func(song["title"], song["artist"], index=index)
+            else:
+                item = func(song["title"], song["artist"])
             if item:
                 # 保留目录发现和音源详情中的平台 ID。
                 merged = {**item, **song}
@@ -814,7 +904,7 @@ def find_source(song):
     if not found:
         return None
     # 下载源严格按 QQ → 网易云 → 酷我；每个源内部已优先选择自身最高 FLAC 档位。
-    source_priority = {"QQ": 0, "网易云": 1, "酷我": 2}
+    source_priority = {"QQ新接口": 0, "QQ": 1, "网易云": 2, "酷我": 3}
     return min(found, key=lambda x: source_priority.get(x.get("source"), 99))
 
 
@@ -1140,7 +1230,7 @@ def main():
         fail("缺少 query")
     log(f"开始任务：mode={mode}, query={query}")
     songs = discover_songs(mode, query)
-    log(f"目录检索完成：共 {len(songs)} 首，歌曲名-歌手名支持同曲 Live、现场、伴奏、Remix 等明确版本，三人及以上合唱已过滤")
+    log(f"目录检索完成：共 {len(songs)} 首，歌曲名-歌手名支持同曲 Live、现场、伴奏、Remix 等明确版本，五人及以上合唱已过滤")
     if not songs:
         message = "未搜索到歌曲，请检查输入的歌曲名称或歌手名称是否正确。"
         log(message)
