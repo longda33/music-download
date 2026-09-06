@@ -232,6 +232,19 @@ def canonical_title(value):
     return dedup_key(value)
 
 
+def dedup_title(value):
+    """用于去重：Live/现场后缀与原版视为同一首歌，显示标题不改变。"""
+    text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    # 只移除明确位于标题末尾的 Live/现场标识，避免误合并不同歌曲。
+    text = re.sub(
+        r"(?:\s*[-－–—]?\s*(?:[（(]\s*)?(?:live|现场版?|live版)(?:\s*[）)])?\s*)$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
+    return canonical_title(text)
+
+
 def query_terms(query):
     """仅按第一个半角短横线分隔歌曲名和歌手名，避免空格造成歧义。"""
     query = str(query or "").strip()
@@ -456,7 +469,7 @@ def platform_discover(query):
         if len(parts) == 1:
             return True
         return any(
-            artists_match(artist, a)
+            canonical_artist(artist) == canonical_artist(a)
             and (canonical_title(title) == canonical_title(t) or is_title_variant(title, t))
             for t, a in pair_terms
         )
@@ -515,6 +528,7 @@ def platform_discover(query):
     exact, pending = [], []
     for item in candidates:
         (exact if item.pop("_exact_match", False) else pending).append(item)
+    log(f"本地艺人/歌曲匹配：命中 {len(exact)} 首，剩余 {len(pending)} 首交给 Gemini")
     matched = gemini_batch_filter(query, pending)
     return exact + [{**item, "_gemini_match": True} for index, item in enumerate(pending) if index in matched]
 
@@ -1253,6 +1267,8 @@ def main():
     skipped = 0
     failed = []
     failed_details = []
+    # 仅在实际下载完成后按体积去重：同名 Live/原版体积相同才视为同一首。
+    downloaded_song_sizes = {}
     for index, original in enumerate(songs, 1):
         label = f"{original['title']} - {original['artist']}"
         log(f"[{index}/{len(songs)}] 搜索音源：{label}")
@@ -1313,6 +1329,14 @@ def main():
             log(f"[{index}/{len(songs)}] 下载完成：{actual / 1048576:.2f} MiB，上传前检查 AList 目录文件")
             if found["size"] and abs(actual - found["size"]) > SIZE_TOLERANCE:
                 raise RuntimeError(f"体积异常 {actual}/{found['size']}")
+            dedup_key_value = (dedup_title(original.get("title", "")), canonical_artist(original.get("artist", "")))
+            known_sizes = downloaded_song_sizes.setdefault(dedup_key_value, set())
+            if actual in known_sizes:
+                local.unlink(missing_ok=True)
+                skipped += 1
+                log(f"[{index}/{len(songs)}] 跳过：同歌曲已有相同体积文件（{actual} bytes）")
+                continue
+            known_sizes.add(actual)
             stage = "metadata"
             embed_metadata(local, found)
             actual = local.stat().st_size
