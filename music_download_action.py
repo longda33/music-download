@@ -151,11 +151,15 @@ def lastfm_recording(row):
 
 ALIAS_FILE = Path(__file__).with_name("artist_aliases.json")
 try:
-    ARTIST_ALIASES = json.loads(ALIAS_FILE.read_text(encoding="utf-8"))
-    if not isinstance(ARTIST_ALIASES, dict):
+    ALIAS_RULES = json.loads(ALIAS_FILE.read_text(encoding="utf-8"))
+    if not isinstance(ALIAS_RULES, dict):
         raise ValueError("artist_aliases.json 必须是 JSON 对象")
+    ARTIST_ALIASES = ALIAS_RULES.get("artist_aliases", {})
+    TITLE_ALIASES = ALIAS_RULES.get("title_aliases", {})
+    if not isinstance(ARTIST_ALIASES, dict) or not isinstance(TITLE_ALIASES, dict):
+        raise ValueError("artist_aliases.json 的 artist_aliases/title_aliases 必须是对象")
 except Exception as exc:
-    raise RuntimeError(f"艺人别名规则文件加载失败：{ALIAS_FILE}: {exc}") from exc
+    raise RuntimeError(f"艺人/歌曲别名规则文件加载失败：{ALIAS_FILE}: {exc}") from exc
 
 ARTIST_FOLDER_NAMES = {
     "jolintsai": "蔡依林",
@@ -209,7 +213,10 @@ def canonical_artist(value):
 
 
 def canonical_title(value):
-    return dedup_key(value)
+    key = dedup_key(value)
+    alias = next((target for source, target in TITLE_ALIASES.items()
+                  if dedup_key(source) == key), key)
+    return dedup_key(alias)
 
 
 def dedup_title(value):
