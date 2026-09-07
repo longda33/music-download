@@ -3,6 +3,7 @@
 """GitHub Action worker: MusicBrainz discovery -> syy.py sources -> AList."""
 import difflib
 import json
+import mimetypes
 import os
 import re
 import signal
@@ -46,6 +47,15 @@ RETRY_INTERVAL = 10
 SOURCE_TIMEOUT = 12
 DETAIL_TIMEOUT = 8
 SIZE_TOLERANCE = 3 * 1024 * 1024
+ALLOW_NON_FLAC = False
+
+
+def parse_download_query(value):
+    """解析末尾 -all；只移除控制参数，不改变歌曲名内部的短横线。"""
+    text = str(value or "").strip()
+    if re.search(r"(?i)-all$", text):
+        return re.sub(r"(?i)-all$", "", text).strip(), True
+    return text, False
 
 
 def log(message):
@@ -544,7 +554,7 @@ def qq_primary_result(query, index=1):
     """新 QQ 接口：通过 n 获取第 index 条 SQ 结果；不使用旧 QQ 参数。"""
     data = request_json(
         "https://a.aa.cab/qq.music",
-        {"msg": query, "n": index, "type": 4},
+        {"msg": query, "n": index, "type": 2 if ALLOW_NON_FLAC else 4},
         SOURCE_HEADERS,
         timeout=SOURCE_TIMEOUT,
         retries=RETRIES,
@@ -569,11 +579,12 @@ def qq_primary_search(title, artist, index=1):
             or not any(artists_match(part, artist) for part in artist_parts)
             or not music):
         return None
-    if not music.lower().split("?")[0].endswith(".flac"):
+    if not ALLOW_NON_FLAC and not music.lower().split("?")[0].endswith(".flac"):
         return None
+    extension = Path(urlparse(music).path).suffix.lower().lstrip(".") or ("flac" if not ALLOW_NON_FLAC else "mp3")
     return {
         "url": music,
-        "filename": f"{row_title} {row_artist}.flac",
+        "filename": f"{row_title} {row_artist}.{extension}",
         "filename_title": row_title,
         "size": int(row.get("size") or 0),
         "source": "QQ新接口",
@@ -643,8 +654,9 @@ def qq_search(title, artist):
         for tier, label in (("sq", "SQ"), ("pq", "PQ")):
             url = detail.get(f"song_play_url_{tier}")
             filename = detail.get(f"song_filename_{tier}")
-            if url and filename and str(filename).lower().endswith(".flac"):
-                return {"url": url, "filename": filename, "filename_title": source_title, "size": int(detail.get(f"song_size_{tier}_str") or 0), "source": "QQ", "quality": label, "platform_ids": {"qq_song_id": detail.get("song_id"), "qq_song_mid": detail.get("song_mid") or row.get("song_mid"), "qq_singer_id": detail.get("singer_id"), "qq_singer_mid": detail.get("singer_mid")}}
+            if url and filename and (ALLOW_NON_FLAC or str(filename).lower().endswith(".flac")):
+                extension = Path(urlparse(str(url)).path).suffix.lower().lstrip(".") or Path(str(filename)).suffix.lower().lstrip(".") or "mp3"
+                return {"url": url, "filename": filename, "filename_title": source_title, "size": int(detail.get(f"song_size_{tier}_str") or 0), "source": "QQ", "quality": label, "extension": extension, "platform_ids": {"qq_song_id": detail.get("song_id"), "qq_song_mid": detail.get("song_mid") or row.get("song_mid"), "qq_singer_id": detail.get("singer_id"), "qq_singer_mid": detail.get("singer_mid")}}
     return None
 
 
@@ -692,7 +704,7 @@ def kuwo_search(title, artist):
             isinstance(t, dict) and str(t.get("format", "")).lower() == "flac"
             for t in types
         )
-        if not has_flac:
+        if not ALLOW_NON_FLAC and not has_flac:
             continue
         detail = request_json(KUWO_API, {"msg": query, "n": index, "br": 1}, SOURCE_HEADERS, timeout=DETAIL_TIMEOUT, retries=RETRIES)
         item = detail.get("data", {}) if isinstance(detail, dict) else {}
@@ -706,8 +718,9 @@ def kuwo_search(title, artist):
             continue
         url = item.get("url") if isinstance(item, dict) else ""
         fmt = str(item.get("format", "")).lower() if isinstance(item, dict) else ""
-        if url and fmt == "flac" and str(url).lower().split("?")[0].endswith(".flac"):
-            return {"url": url, "filename": f"{title}.flac", "filename_title": detail_title, "size": size_bytes(item.get("size", "")), "source": "酷我", "quality": f"FLAC {item.get('bitrate', '2000')}kbps", "platform_ids": {"kuwo_id": item.get("id"), "kuwo_rid": item.get("rid") or row.get("rid")}}
+        if url and (ALLOW_NON_FLAC or (fmt == "flac" and str(url).lower().split("?")[0].endswith(".flac"))):
+            extension = Path(urlparse(str(url)).path).suffix.lower().lstrip(".") or fmt or "mp3"
+            return {"url": url, "filename": f"{title}.{extension}", "filename_title": detail_title, "size": size_bytes(item.get("size", "")), "source": "酷我", "quality": f"{fmt.upper() or 'AUDIO'} {item.get('bitrate', '')}kbps", "extension": extension, "platform_ids": {"kuwo_id": item.get("id"), "kuwo_rid": item.get("rid") or row.get("rid")}}
     return None
 
 
@@ -722,15 +735,16 @@ def netease_search(title, artist):
         if not song_id:
             continue
         # 搜索和下载接口分开：明确请求网易云无损档位 br=2000。
-        download_url = f"{NETEASE_API}?server=netease&type=url&id={song_id}&br=2000"
+        download_url = f"{NETEASE_API}?server=netease&type=url&id={song_id}&br={320 if ALLOW_NON_FLAC else 2000}"
         try:
             probe = http_request("GET", download_url, headers=SOURCE_HEADERS, timeout=60, allow_redirects=True, stream=True)
             content_type = probe.headers.get("content-type", "").lower()
             is_flac = ".flac" in probe.url.lower() or "audio/flac" in content_type or "audio/x-flac" in content_type
             size = int(probe.headers.get("content-length", 0) or 0)
             probe.close()
-            if is_flac:
-                return {"url": download_url, "filename": f"{title}.flac", "filename_title": str(row_title).strip(), "size": size, "source": "网易云", "quality": "FLAC", "platform_ids": {"netease_song_id": song_id, "netease_cover_id": parse_qs(urlparse(str(row.get("pic") or "")).query).get("id", [""])[0]}}
+            if ALLOW_NON_FLAC or is_flac:
+                extension = Path(urlparse(probe.url).path).suffix.lower().lstrip(".") or ("flac" if is_flac else "mp3")
+                return {"url": download_url, "filename": f"{title}.{extension}", "filename_title": str(row_title).strip(), "size": size, "source": "网易云", "quality": "FLAC" if is_flac else "标准音质", "extension": extension, "platform_ids": {"netease_song_id": song_id, "netease_cover_id": parse_qs(urlparse(str(row.get("pic") or "")).query).get("id", [""])[0]}}
         except Exception:
             pass
     return None
@@ -1015,7 +1029,8 @@ def upload(auth, local_path, filename, subfolder=None):
     expected = local_path.stat().st_size
     log(f"AList API 上传：{filename}")
     encoded_path = quote(path, safe="/")
-    headers = alist_headers(auth, {"File-Path": encoded_path, "Content-Length": str(expected), "Content-Type": "audio/flac", "As-Task": "false"})
+    content_type = mimetypes.guess_type(str(local_path))[0] or "application/octet-stream"
+    headers = alist_headers(auth, {"File-Path": encoded_path, "Content-Length": str(expected), "Content-Type": content_type, "As-Task": "false"})
     with local_path.open("rb") as handle:
         r = http_request("PUT", alist_api(auth, "put"), headers=headers, data=handle, timeout=600)
     try:
@@ -1076,7 +1091,10 @@ def main():
         fail("EVENT_PAYLOAD 为空")
     payload = json.loads(raw) if isinstance(raw, str) else raw
     ACTIVE_PAYLOAD = payload
-    mode, query = payload.get("mode", "singer"), str(payload.get("query", "")).strip()
+    query, query_all = parse_download_query(payload.get("query", ""))
+    global ALLOW_NON_FLAC
+    ALLOW_NON_FLAC = bool(payload.get("allow_non_flac") or query_all)
+    mode = payload.get("mode", "singer")
     if not query:
         fail("缺少 query")
     log(f"开始任务：mode={mode}, query={query}")
@@ -1111,14 +1129,14 @@ def main():
         log(f"[{index}/{len(songs)}] 搜索音源：{label}")
         found = find_source(original)
         if not found:
-            log(f"[{index}/{len(songs)}] 失败：三个音源都没有可用 FLAC")
+            log(f"[{index}/{len(songs)}] 失败：三个音源都没有找到可用音频")
             failed.append(label)
             failed_details.append({
                 "title": original.get("title", ""),
                 "artist": original.get("artist", ""),
                 "stage": "source_resolution",
                 "source": "QQ/网易云/酷我",
-                "error": "三个音源都没有找到可用 FLAC 下载地址",
+                "error": "三个音源都没有找到可用音频下载地址",
             })
             continue
         log(f"[{index}/{len(songs)}] 找到音源：{found['source']} {found.get('quality', 'FLAC')}")
@@ -1140,7 +1158,8 @@ def main():
         target_folder = safe_name(normalize_folder_label(folder_label)) if single_title_search else artist_folder
         ensure_alist_folder(auth, target_folder)
         log(f"[{index}/{len(songs)}] 目标文件夹：{target_folder}")
-        base_filename = safe_name(f"{filename_title} {original['artist']}.flac")
+        extension = str(found.get("extension") or Path(str(found.get("filename") or "")).suffix.lstrip(".") or "flac").lower()
+        base_filename = safe_name(f"{filename_title} {original['artist']}.{extension}")
         local = work / base_filename
         stage = "download"
         try:
@@ -1175,7 +1194,10 @@ def main():
                 continue
             known_sizes.add(actual)
             stage = "metadata"
-            embed_metadata(local, found)
+            if extension == "flac":
+                embed_metadata(local, found)
+            else:
+                log(f"[{index}/{len(songs)}] 非 FLAC 音频，跳过 FLAC 元数据封装")
             actual = local.stat().st_size
             stage = "alist_listing"
             filename = choose_filename(auth, base_filename, actual, subfolder=target_folder)
