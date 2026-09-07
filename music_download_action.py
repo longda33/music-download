@@ -777,7 +777,7 @@ def find_source(song):
             if item:
                 merged = {**item, **song}
                 merged["platform_ids"] = {**item.get("platform_ids", {}), **song.get("platform_ids", {})}
-                log(f"音源下载顺序：优先使用 {source}，已成功解析")
+                log(f"音源解析：使用 {source}，已成功解析")
                 return merged
         except Exception as exc:
             log(f"{source} 搜索失败，准备尝试下一个音源：{exc}")
