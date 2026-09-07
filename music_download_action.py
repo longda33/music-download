@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """GitHub Action worker: MusicBrainz discovery -> syy.py sources -> AList."""
+import difflib
 import json
 import os
 import re
@@ -149,23 +150,7 @@ def lastfm_recording(row):
     return {"title": title, "artist": artist, "artist_ids": [artist_id] if artist_id else [], "recording_id": row.get("mbid"), "isrc": row.get("isrc"), "year": None, "lastfm_url": row.get("url")} if title and artist else None
 
 
-ALIAS_FILE = Path(__file__).with_name("artist_aliases.json")
-try:
-    ALIAS_RULES = json.loads(ALIAS_FILE.read_text(encoding="utf-8"))
-    if not isinstance(ALIAS_RULES, dict):
-        raise ValueError("artist_aliases.json 必须是 JSON 对象")
-    ARTIST_ALIASES = ALIAS_RULES.get("artist_aliases", {})
-    TITLE_ALIASES = ALIAS_RULES.get("title_aliases", {})
-    if not isinstance(ARTIST_ALIASES, dict) or not isinstance(TITLE_ALIASES, dict):
-        raise ValueError("artist_aliases.json 的 artist_aliases/title_aliases 必须是对象")
-except Exception as exc:
-    raise RuntimeError(f"艺人/歌曲别名规则文件加载失败：{ALIAS_FILE}: {exc}") from exc
-
-ARTIST_FOLDER_NAMES = {
-    "jolintsai": "蔡依林",
-    "zhaolusi": "赵露思",
-    "dengshimeijun": "等什么君",
-}
+ARTIST_FOLDER_NAMES = {}
 
 
 def dedup_key(value):
@@ -196,27 +181,14 @@ def simplify_chinese_lyrics(lyrics, title, artist):
 
 
 def canonical_artist(value):
+    """使用 Unicode/繁简/标点归一化生成艺人身份，不依赖别名表。"""
     raw = unicodedata.normalize("NFKC", to_simplified(value)).strip().casefold()
-    compact = dedup_key(raw)
-    direct = ARTIST_ALIASES.get(raw, ARTIST_ALIASES.get(compact))
-    if direct:
-        return direct
-    # 将“等什么君(邓寓君)”“邓寓君（等什么君）”等写法拆成别名片段；
-    # 只要所有片段指向同一规范艺人，就统一使用同一个身份和文件夹。
-    fragments = re.split(r"[\s&+/、,，;；()（）\[\]【】]+", raw)
-    mapped = [ARTIST_ALIASES.get(fragment, ARTIST_ALIASES.get(dedup_key(fragment)))
-              for fragment in fragments if fragment]
-    mapped = [item for item in mapped if item]
-    if mapped and len(set(mapped)) == 1:
-        return mapped[0]
-    return compact
+    parts = [dedup_key(part) for part in re.split(r"[&+/、,，;；|]+", raw) if part.strip()]
+    return "&".join(sorted(set(parts)))
 
 
 def canonical_title(value):
-    key = dedup_key(value)
-    alias = next((target for source, target in TITLE_ALIASES.items()
-                  if dedup_key(source) == key), key)
-    return dedup_key(alias)
+    return dedup_key(unicodedata.normalize("NFKC", to_simplified(value or "")).strip())
 
 
 def dedup_title(value):
@@ -275,9 +247,21 @@ def normalize_folder_label(value):
 
 
 def artists_match(left, right):
-    """仅使用本地规则判断艺人别名。"""
-    left, right = str(left or "").strip(), str(right or "").strip()
-    return bool(left and right and canonical_artist(left) == canonical_artist(right))
+    """使用归一化、包含关系和相似度识别艺人，不依赖规则表或别名穷举。"""
+    left_key, right_key = canonical_artist(left), canonical_artist(right)
+    if not left_key or not right_key:
+        return False
+    if left_key == right_key:
+        return True
+    # 仅对单一艺人做模糊判断，避免把合作艺人列表错误合并。
+    if "&" in left_key or "&" in right_key:
+        return False
+    shorter = min(len(left_key), len(right_key))
+    if shorter < 4:
+        return False
+    if left_key in right_key or right_key in left_key:
+        return True
+    return difflib.SequenceMatcher(None, left_key, right_key).ratio() >= 0.92
 
 
 def artist_folder_name(value, related=None):
