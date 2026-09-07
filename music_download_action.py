@@ -275,7 +275,7 @@ def artists_match(left, right):
 
 
 def artist_folder_name(value, related=None):
-    """将本地别名统一为稳定的文件夹名称。"""
+    """生成稳定的艺人文件夹名称，不依赖别名文件。"""
     key = canonical_artist(value)
     return normalize_folder_label(ARTIST_FOLDER_NAMES.get(key) or value)
 
@@ -337,6 +337,7 @@ def platform_discover(query):
             title, artist = row.get("title"), row.get("artist")
             if accept(title, artist):
                 row["_exact_match"] = exact_accept(title, artist)
+                row["discovery_source"] = "QQ aa.cab"
                 candidates.append(row)
     except Exception as exc:
         log(f"新 QQ 实时目录搜索失败：{exc}")
@@ -347,7 +348,7 @@ def platform_discover(query):
             title = row.get("song_title") or row.get("song_name")
             artist = row.get("singer_name")
             if accept(title, artist):
-                candidates.append({"title": title, "artist": artist, "platform_ids": {"qq_song_mid": row.get("song_mid")}, "artist_ids": [], "recording_id": None, "isrc": None, "year": None, "_exact_match": exact_accept(title, artist)})
+                candidates.append({"title": title, "artist": artist, "discovery_source": "QQ tang.api.s01s.cn", "platform_ids": {"qq_song_mid": row.get("song_mid")}, "artist_ids": [], "recording_id": None, "isrc": None, "year": None, "_exact_match": exact_accept(title, artist)})
     except Exception as exc:
         log(f"QQ 实时目录搜索失败：{exc}")
 
@@ -357,7 +358,7 @@ def platform_discover(query):
         for row in rows:
             title, artist = row.get("song"), row.get("singer")
             if accept(title, artist):
-                candidates.append({"title": title, "artist": artist, "platform_ids": {"kuwo_rid": row.get("rid")}, "artist_ids": [], "recording_id": None, "isrc": None, "year": None, "_exact_match": exact_accept(title, artist)})
+                candidates.append({"title": title, "artist": artist, "discovery_source": "酷我", "platform_ids": {"kuwo_rid": row.get("rid")}, "artist_ids": [], "recording_id": None, "isrc": None, "year": None, "_exact_match": exact_accept(title, artist)})
     except Exception as exc:
         log(f"酷我实时目录搜索失败：{exc}")
 
@@ -369,14 +370,14 @@ def platform_discover(query):
             if accept(title, artist):
                 netease_song_id = parse_qs(urlparse(str(row.get("url") or "")).query).get("id", [""])[0]
                 netease_cover_id = parse_qs(urlparse(str(row.get("pic") or "")).query).get("id", [""])[0]
-                candidates.append({"title": title, "artist": artist, "platform_ids": {"netease_song_id": netease_song_id, "netease_cover_id": netease_cover_id}, "artist_ids": [], "recording_id": None, "isrc": None, "year": None, "_exact_match": exact_accept(title, artist)})
+                candidates.append({"title": title, "artist": artist, "discovery_source": "网易云", "platform_ids": {"netease_song_id": netease_song_id, "netease_cover_id": netease_cover_id}, "artist_ids": [], "recording_id": None, "isrc": None, "year": None, "_exact_match": exact_accept(title, artist)})
     except Exception as exc:
         log(f"网易云实时目录搜索失败：{exc}")
     exact, pending = [], []
     for item in candidates:
         (exact if item.pop("_exact_match", False) else pending).append(item)
     if pending:
-        log(f"本地规则未确认 {len(pending)} 首，已跳过；不会调用 AI")
+        log(f"本地匹配未确认 {len(pending)} 首，已跳过")
     return exact
 
 
@@ -442,7 +443,7 @@ def discover_songs(mode, query):
                     if len(rows) < 100:
                         break
         elif mode == "search":
-            # 使用“歌曲名-歌手名”时只下载一首；不含短横线时按完整歌曲名搜索。
+            # 单项搜索会同时处理歌曲名、歌手名和明确版本。
             parts = query_terms(query)
             if len(parts) == 1:
                 # 单项可能是歌手名：优先抓取该艺人的完整目录。
@@ -537,7 +538,7 @@ def discover_songs(mode, query):
                 artist_match = canonical_artist(song.get("artist", "")) == canonical_artist(query)
                 if not (title_match or version_match or artist_match or space_pair_match(song, query)):
                     continue
-        artists = [{"artist": {"name": name.strip()}} for name in song["artist"].split(" & ") if name.strip()]
+        artists = [{"artist": {"name": name.strip()}} for name in re.split(r"[&+/、,，;；|]+", str(song.get("artist", ""))) if name.strip()]
         if not song["title"] or not one_artist(artists):
             continue
         keys = identity_keys(song)
@@ -587,8 +588,8 @@ def qq_primary_search(title, artist, index=1):
         "filename": f"{row_title} {row_artist}.{extension}",
         "filename_title": row_title,
         "size": int(row.get("size") or 0),
-        "source": "QQ新接口",
-        "quality": "SQ无损",
+        "source": "QQ aa.cab",
+        "quality": "标准音质" if ALLOW_NON_FLAC else "SQ无损",
         "platform_ids": {
             "qq_primary_mid": row.get("mid"),
             "qq_primary_media_mid": row.get("media_mid"),
@@ -656,7 +657,7 @@ def qq_search(title, artist):
             filename = detail.get(f"song_filename_{tier}")
             if url and filename and (ALLOW_NON_FLAC or str(filename).lower().endswith(".flac")):
                 extension = Path(urlparse(str(url)).path).suffix.lower().lstrip(".") or Path(str(filename)).suffix.lower().lstrip(".") or "mp3"
-                return {"url": url, "filename": filename, "filename_title": source_title, "size": int(detail.get(f"song_size_{tier}_str") or 0), "source": "QQ", "quality": label, "extension": extension, "platform_ids": {"qq_song_id": detail.get("song_id"), "qq_song_mid": detail.get("song_mid") or row.get("song_mid"), "qq_singer_id": detail.get("singer_id"), "qq_singer_mid": detail.get("singer_mid")}}
+                return {"url": url, "filename": filename, "filename_title": source_title, "size": int(detail.get(f"song_size_{tier}_str") or 0), "source": "QQ tang.api.s01s.cn", "quality": label, "extension": extension, "platform_ids": {"qq_song_id": detail.get("song_id"), "qq_song_mid": detail.get("song_mid") or row.get("song_mid"), "qq_singer_id": detail.get("singer_id"), "qq_singer_mid": detail.get("singer_mid")}}
     return None
 
 
@@ -751,8 +752,22 @@ def netease_search(title, artist):
 
 
 def find_source(song):
-    found = []
-    for func in (qq_primary_search, qq_search, netease_search, kuwo_search):
+    """先使用发现该歌曲的音源，失败后按循环顺序尝试其余音源。"""
+    source_funcs = {
+        "QQ aa.cab": qq_primary_search,
+        "QQ tang.api.s01s.cn": qq_search,
+        "网易云": netease_search,
+        "酷我": kuwo_search,
+    }
+    source_order = ["QQ aa.cab", "QQ tang.api.s01s.cn", "网易云", "酷我"]
+    preferred = song.get("discovery_source")
+    if preferred in source_order:
+        ordered_sources = [preferred] + [source for source in source_order if source != preferred]
+    else:
+        ordered_sources = source_order
+
+    for source in ordered_sources:
+        func = source_funcs[source]
         try:
             if func is qq_primary_search:
                 index = int((song.get("platform_ids") or {}).get("qq_primary_n") or 1)
@@ -760,17 +775,13 @@ def find_source(song):
             else:
                 item = func(song["title"], song["artist"])
             if item:
-                # 保留目录发现和音源详情中的平台 ID。
                 merged = {**item, **song}
                 merged["platform_ids"] = {**item.get("platform_ids", {}), **song.get("platform_ids", {})}
-                found.append(merged)
+                log(f"音源下载顺序：优先使用 {source}，已成功解析")
+                return merged
         except Exception as exc:
-            log(f"{func.__name__} 搜索失败：{exc}")
-    if not found:
-        return None
-    # 下载源严格按 QQ → 网易云 → 酷我；每个源内部已优先选择自身最高 FLAC 档位。
-    source_priority = {"QQ新接口": 0, "QQ": 1, "网易云": 2, "酷我": 3}
-    return min(found, key=lambda x: source_priority.get(x.get("source"), 99))
+            log(f"{source} 搜索失败，准备尝试下一个音源：{exc}")
+    return None
 
 
 def netease_metadata(title, artist):
@@ -1135,7 +1146,7 @@ def main():
                 "title": original.get("title", ""),
                 "artist": original.get("artist", ""),
                 "stage": "source_resolution",
-                "source": "QQ/网易云/酷我",
+                "source": "QQ aa.cab/QQ tang.api.s01s.cn/网易云音乐/酷我音乐",
                 "error": "三个音源都没有找到可用音频下载地址",
             })
             continue
