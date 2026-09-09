@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""GitHub Action worker: MusicBrainz discovery -> syy.py sources -> AList."""
+"""GitHub Action worker: MusicBrainz discovery -> syy.py sources -> OpenList."""
 import difflib
+import functools
 import json
 import mimetypes
 import os
@@ -51,6 +52,9 @@ SOURCE_TIMEOUT = 12
 DETAIL_TIMEOUT = 8
 SIZE_TOLERANCE = 3 * 1024 * 1024
 ALLOW_NON_FLAC = False
+SOURCE_BREAKER_THRESHOLD = 2
+SOURCE_BREAKER_COOLDOWN = 120
+SOURCE_BREAKER = {}
 
 
 def parse_download_query(value):
@@ -167,6 +171,7 @@ def lastfm_recording(row):
 ARTIST_FOLDER_NAMES = {}
 
 
+@functools.lru_cache(maxsize=2048)
 def dedup_key(value):
     value = unicodedata.normalize("NFKC", str(value)).casefold()
     return "".join(ch for ch in value if ch.isalnum())
@@ -194,6 +199,7 @@ def simplify_chinese_lyrics(lyrics, title, artist):
     return to_simplified(lyrics).strip()
 
 
+@functools.lru_cache(maxsize=2048)
 def canonical_artist(value):
     """使用 Unicode/繁简/标点归一化生成艺人身份，不依赖别名表。"""
     raw = unicodedata.normalize("NFKC", to_simplified(value)).strip().casefold()
@@ -201,6 +207,7 @@ def canonical_artist(value):
     return "&".join(sorted(set(parts)))
 
 
+@functools.lru_cache(maxsize=2048)
 def canonical_title(value):
     return dedup_key(unicodedata.normalize("NFKC", to_simplified(value or "")).strip())
 
@@ -747,7 +754,7 @@ def netease_search(title, artist):
             probe.close()
             if ALLOW_NON_FLAC or is_flac:
                 extension = Path(urlparse(probe.url).path).suffix.lower().lstrip(".") or ("flac" if is_flac else "mp3")
-                return {"url": download_url, "filename": f"{title}.{extension}", "filename_title": str(row_title).strip(), "size": size, "source": "网易云", "quality": "FLAC" if is_flac else "标准音质", "extension": extension, "platform_ids": {"netease_song_id": song_id, "netease_cover_id": parse_qs(urlparse(str(row.get("pic") or "")).query).get("id", [""])[0]}}
+                return {"url": download_url, "filename": f"{title}.{extension}", "filename_title": str(row_title).strip(), "size": size, "source": "网易云", "quality": "FLAC" if is_flac else "标准音质", "extension": extension, "album": str(row.get("album") or "").strip(), "cover_url": str(row.get("pic") or "").strip(), "lyric_url": str(row.get("lrc") or "").strip(), "platform_ids": {"netease_song_id": song_id, "netease_cover_id": parse_qs(urlparse(str(row.get("pic") or "")).query).get("id", [""])[0]}}
         except Exception:
             pass
     return None
@@ -770,7 +777,7 @@ def find_source(song, excluded_sources=None):
         ordered_sources = source_order
 
     for source in ordered_sources:
-        if source in excluded:
+        if source in excluded or source_breaker_open(source):
             continue
         func = source_funcs[source]
         try:
@@ -780,13 +787,47 @@ def find_source(song, excluded_sources=None):
             else:
                 item = func(song["title"], song["artist"])
             if item:
+                source_breaker_success(source)
                 merged = {**item, **song}
                 merged["platform_ids"] = {**item.get("platform_ids", {}), **song.get("platform_ids", {})}
                 log(f"音源解析：使用 {source}，已成功解析")
                 return merged
         except Exception as exc:
+            source_breaker_failure(source, exc)
             log(f"{source} 搜索失败，准备尝试下一个音源：{exc}")
     return None
+
+
+def source_breaker_open(source):
+    state = SOURCE_BREAKER.get(source)
+    if not state:
+        return False
+    if state["opened_until"] <= 0:
+        return False
+    if time.monotonic() >= state["opened_until"]:
+        SOURCE_BREAKER.pop(source, None)
+        return False
+    return True
+
+
+def source_breaker_failure(source, exc):
+    text = str(exc).lower()
+    transient = (
+        isinstance(exc, requests.exceptions.Timeout)
+        or any(marker in text for marker in ("timeout", "timed out", "超时", "连接超时"))
+        or "http 5" in text
+    )
+    if not transient:
+        return
+    state = SOURCE_BREAKER.setdefault(source, {"failures": 0, "opened_until": 0})
+    state["failures"] += 1
+    if state["failures"] >= SOURCE_BREAKER_THRESHOLD:
+        state["opened_until"] = time.monotonic() + SOURCE_BREAKER_COOLDOWN
+        log(f"{source} 连续暂时不可用，熔断 {SOURCE_BREAKER_COOLDOWN} 秒")
+
+
+def source_breaker_success(source):
+    SOURCE_BREAKER.pop(source, None)
 
 
 def download_audio(found, local, index, total_count):
@@ -812,8 +853,16 @@ def download_audio(found, local, index, total_count):
     return local.stat().st_size
 
 
-def netease_metadata(title, artist):
-    """网易云元数据独立于音频格式；先歌手精确匹配，失败时安全回退到唯一歌曲名。"""
+def netease_metadata(title, artist, seed=None):
+    """网易云元数据独立于音频格式；优先复用找源阶段数据。"""
+    seed = seed if isinstance(seed, dict) else {}
+    if seed.get("cover_url") or seed.get("lyric_url") or seed.get("album"):
+        lyrics = ""
+        if seed.get("lyric_url"):
+            lyric = http_request("GET", seed["lyric_url"], headers=SOURCE_HEADERS, timeout=DETAIL_TIMEOUT)
+            if lyric.ok:
+                lyrics = simplify_chinese_lyrics(lyric.text, title, artist)
+        return {"album": str(seed.get("album") or ""), "cover_url": str(seed.get("cover_url") or ""), "lyrics": lyrics}
     try:
         title_rows = []
         seen_urls = set()
@@ -886,7 +935,7 @@ def embed_metadata(local_path, song):
         audio["comment"] = [f"Source: {song.get('source', '')}; Quality: {song.get('quality', '')}"]
 
         # 网易云优先提供封面、歌词和专辑信息。
-        netease = netease_metadata(title, artist)
+        netease = netease_metadata(title, artist, seed=song)
         if netease.get("album") and not song.get("album"):
             audio["album"] = [netease["album"]]
         if netease.get("lyrics"):
@@ -984,56 +1033,56 @@ def safe_name(value):
     return (value or "unknown")[:180]
 
 
-def alist_auth():
-    required = ["ALIST_URL", "ALIST_TOKEN"]
+def openlist_auth():
+    required = ["OPENLIST_URL", "OPENLIST_TOKEN"]
     missing = [key for key in required if not os.getenv(key)]
     if missing:
-        fail("缺少 AList Secret: " + ", ".join(missing))
-    return (os.environ["ALIST_URL"].rstrip("/"), os.environ["ALIST_TOKEN"])
+        fail("缺少 OpenList Secret: " + ", ".join(missing))
+    return (os.environ["OPENLIST_URL"].rstrip("/"), os.environ["OPENLIST_TOKEN"])
 
 
-def alist_headers(auth, extra=None):
+def openlist_headers(auth, extra=None):
     headers = {"Authorization": auth[1]}
     if extra:
         headers.update(extra)
     return headers
 
 
-def alist_file_path(filename=None, subfolder=None):
-    base = (os.getenv("ALIST_PATH") or "/cd18/Music").strip("/")
+def openlist_file_path(filename=None, subfolder=None):
+    base = (os.getenv("OPENLIST_PATH") or "/cd18/Music").strip("/")
     parts = [part for part in base.split("/") if part]
     if subfolder:
         parts.append(safe_name(str(subfolder).strip("/")))
     if filename:
-        # 最后一层防线：文件名绝不能把 / 或 \ 传给 AList。
+        # 最后一层防线：文件名绝不能把 / 或 \ 传给 OpenList。
         parts.append(safe_name(str(filename).strip("/")))
     return "/" + "/".join(parts)
 
 
-def alist_api(auth, endpoint):
+def openlist_api(auth, endpoint):
     return f"{auth[0]}/api/fs/{endpoint.lstrip('/')}"
 
 
-def ensure_alist_folder(auth, subfolder=None):
-    path = alist_file_path(subfolder=subfolder)
-    r = http_request("POST", alist_api(auth, "mkdir"), headers=alist_headers(auth, {"Content-Type": "application/json"}), json={"path": path}, timeout=60)
+def ensure_openlist_folder(auth, subfolder=None):
+    path = openlist_file_path(subfolder=subfolder)
+    r = http_request("POST", openlist_api(auth, "mkdir"), headers=openlist_headers(auth, {"Content-Type": "application/json"}), json={"path": path}, timeout=60)
     if r.status_code >= 400:
         try:
             data = r.json()
         except ValueError:
             data = {}
-        # AList 已存在目录时返回错误，后续 list/put 仍可正常进行。
+        # OpenList 已存在目录时返回错误，后续 list/put 仍可正常进行。
         if data.get("code") not in (200, 400):
             r.raise_for_status()
 
 
-def alist_listing(auth, subfolder=None):
-    path = alist_file_path(subfolder=subfolder)
-    r = http_request("POST", alist_api(auth, "list"), headers=alist_headers(auth, {"Content-Type": "application/json"}), json={"path": path, "password": "", "page": 1, "per_page": 1000, "refresh": True}, timeout=60)
+def openlist_listing(auth, subfolder=None):
+    path = openlist_file_path(subfolder=subfolder)
+    r = http_request("POST", openlist_api(auth, "list"), headers=openlist_headers(auth, {"Content-Type": "application/json"}), json={"path": path, "password": "", "page": 1, "per_page": 1000, "refresh": True}, timeout=60)
     r.raise_for_status()
     data = r.json()
     if data.get("code") != 200:
-        raise RuntimeError(f"AList 列目录失败：{data.get('message', data)}")
+        raise RuntimeError(f"OpenList 列目录失败：{data.get('message', data)}")
     result = {}
     for item in (data.get("data") or {}).get("content", []) or []:
         if isinstance(item, dict) and item.get("name"):
@@ -1051,9 +1100,9 @@ def alist_listing(auth, subfolder=None):
     return result
 
 
-def choose_filename(auth, base_filename, size, subfolder=None):
+def choose_filename(auth, base_filename, size, subfolder=None, files=None):
     """同名且相近则跳过；同名不同体积则追加 [xx.xxMB]。"""
-    files = alist_listing(auth, subfolder=subfolder)
+    files = files if files is not None else openlist_listing(auth, subfolder=subfolder)
     if base_filename in files and abs(files[base_filename] - size) <= SIZE_TOLERANCE:
         return None
     if base_filename not in files:
@@ -1070,18 +1119,18 @@ def choose_filename(auth, base_filename, size, subfolder=None):
 
 def upload(auth, local_path, filename, subfolder=None):
     filename = safe_name(filename)
-    path = alist_file_path(filename, subfolder=subfolder)
+    path = openlist_file_path(filename, subfolder=subfolder)
     expected = local_path.stat().st_size
-    log(f"AList API 上传：{filename}")
+    log(f"OpenList API 上传：{filename}")
     encoded_path = quote(path, safe="/")
     content_type = mimetypes.guess_type(str(local_path))[0] or "application/octet-stream"
-    headers = alist_headers(auth, {"File-Path": encoded_path, "Content-Length": str(expected), "Content-Type": content_type, "As-Task": "false"})
+    headers = openlist_headers(auth, {"File-Path": encoded_path, "Content-Length": str(expected), "Content-Type": content_type, "As-Task": "false"})
     with local_path.open("rb") as handle:
-        r = http_request("PUT", alist_api(auth, "put"), headers=headers, data=handle, timeout=600)
+        r = http_request("PUT", openlist_api(auth, "put"), headers=headers, data=handle, timeout=600)
     try:
         data = r.json()
     except ValueError as exc:
-        raise RuntimeError(f"AList 上传返回非 JSON：HTTP {r.status_code}") from exc
+        raise RuntimeError(f"OpenList 上传返回非 JSON：HTTP {r.status_code}") from exc
     if r.status_code >= 400 or data.get("code") != 200:
         # 部分挂载盘会先完成写入，再因解析远端时间失败而返回错误。
         # 只有按文件名和大小确认远端文件存在时，才将此类响应计为成功。
@@ -1090,22 +1139,22 @@ def upload(auth, local_path, filename, subfolder=None):
             if attempt:
                 time.sleep(RETRY_INTERVAL)
             try:
-                files = alist_listing(auth, subfolder=subfolder)
+                files = openlist_listing(auth, subfolder=subfolder)
                 last_observed = files.get(filename)
                 if filename in files and last_observed and abs(last_observed - expected) <= SIZE_TOLERANCE:
-                    log(f"AList 返回错误，但远程文件已确认存在：{filename}")
+                    log(f"OpenList 返回错误，但远程文件已确认存在：{filename}")
                     return
             except Exception as verify_exc:
                 last_observed = f"确认接口异常：{verify_exc}"
         message = data.get("message", data) if isinstance(data, dict) else data
         if last_observed is not None:
-            log(f"AList 上传后确认未通过：文件={filename}，远程大小={last_observed}，本地大小={expected}")
-        # 挂载盘已写入文件，但 AList 在构造响应时解析非标准时间失败。
+            log(f"OpenList 上传后确认未通过：文件={filename}，远程大小={last_observed}，本地大小={expected}")
+        # 挂载盘已写入文件，但 OpenList 在构造响应时解析非标准时间失败。
         # 该特征错误发生在写入之后；目录接口也可能继承同一时间解析问题。
         if isinstance(message, str) and message.startswith("parsing time "):
-            log(f"AList 返回时间解析错误，按文件已提交处理：{filename}")
+            log(f"OpenList 返回时间解析错误，按文件已提交处理：{filename}")
             return
-        raise RuntimeError(f"AList 上传失败：{message}")
+        raise RuntimeError(f"OpenList 上传失败：{message}")
 
 
 def callback(payload):
@@ -1158,15 +1207,16 @@ def main():
         callback(payload)
         print(json.dumps({"status": "no_results", "success_count": 0, "skipped_count": 0, "failed_songs": [], "failed_details": [], "error": message}, ensure_ascii=False))
         return
-    auth = alist_auth()
-    ensure_alist_folder(auth)
-    log("AList API 连接正常，开始逐首处理；单项歌曲名搜索保存到歌曲名文件夹，歌手搜索保存到歌手文件夹")
+    auth = openlist_auth()
+    ensure_openlist_folder(auth)
+    log("OpenList API 连接正常，开始逐首处理；单项歌曲名搜索保存到歌曲名文件夹，歌手搜索保存到歌手文件夹")
     work = Path("downloaded_music")
     work.mkdir(exist_ok=True)
     success = 0
     skipped = 0
     failed = []
     failed_details = []
+    openlist_cache = {}
     # 仅在实际下载完成后按体积去重：同名 Live/原版体积相同才视为同一首。
     downloaded_song_sizes = {}
     for index, original in enumerate(songs, 1):
@@ -1201,11 +1251,14 @@ def main():
             artist_folder = safe_name(artist_folder_name(found["artist"], original.get("artist")))
         folder_label = query if single_title_search else (original.get("title") or filename_title)
         target_folder = safe_name(normalize_folder_label(folder_label)) if single_title_search else artist_folder
-        ensure_alist_folder(auth, target_folder)
+        ensure_openlist_folder(auth, target_folder)
+        if target_folder not in openlist_cache:
+            openlist_cache[target_folder] = openlist_listing(auth, subfolder=target_folder)
         log(f"[{index}/{len(songs)}] 目标文件夹：{target_folder}")
         extension = str(found.get("extension") or Path(str(found.get("filename") or "")).suffix.lstrip(".") or "flac").lower()
         base_filename = safe_name(f"{filename_title} {original['artist']}.{extension}")
-        local = work / base_filename
+        final_local = work / base_filename
+        local = final_local.with_name(final_local.name + ".tmp")
         stage = "download"
         try:
             attempted_sources = set()
@@ -1217,6 +1270,7 @@ def main():
                 except Exception as download_exc:
                     local.unlink(missing_ok=True)
                     failed_source = str(found.get("source", "unknown"))
+                    source_breaker_failure(failed_source, download_exc)
                     log(f"[{index}/{len(songs)}] 下载失败：音源={failed_source}，原因={download_exc}；准备切换下一个音源")
                     next_found = find_source(original, excluded_sources=attempted_sources)
                     if not next_found:
@@ -1225,12 +1279,15 @@ def main():
                     filename_title = safe_name(str(found.get("filename_title") or original["title"]).strip())
                     extension = str(found.get("extension") or Path(str(found.get("filename") or "")).suffix.lstrip(".") or "flac").lower()
                     base_filename = safe_name(f"{filename_title} {original['artist']}.{extension}")
-                    local = work / base_filename
+                    final_local = work / base_filename
+                    local = final_local.with_name(final_local.name + ".tmp")
                     log(f"[{index}/{len(songs)}] 切换音源：{found['source']}")
 
-            log(f"[{index}/{len(songs)}] 下载完成：{actual / 1048576:.2f} MiB，上传前检查 AList 目录文件")
+            log(f"[{index}/{len(songs)}] 下载完成：{actual / 1048576:.2f} MiB，上传前检查 OpenList 目录文件")
             if found["size"] and abs(actual - found["size"]) > SIZE_TOLERANCE:
                 raise RuntimeError(f"体积异常 {actual}/{found['size']}")
+            os.replace(local, final_local)
+            local = final_local
             dedup_key_value = (dedup_title(original.get("title", "")), canonical_artist(original.get("artist", "")))
             known_sizes = downloaded_song_sizes.setdefault(dedup_key_value, set())
             if actual in known_sizes:
@@ -1245,20 +1302,22 @@ def main():
             else:
                 log(f"[{index}/{len(songs)}] 非 FLAC 音频，跳过 FLAC 元数据封装")
             actual = local.stat().st_size
-            stage = "alist_listing"
-            filename = choose_filename(auth, base_filename, actual, subfolder=target_folder)
+            stage = "openlist_listing"
+            filename = choose_filename(auth, base_filename, actual, subfolder=target_folder, files=openlist_cache[target_folder])
             if filename is None:
                 local.unlink(missing_ok=True)
                 skipped += 1
-                log(f"[{index}/{len(songs)}] 跳过：AList 已存在相同文件")
+                log(f"[{index}/{len(songs)}] 跳过：OpenList 已存在相同文件")
                 continue
             stage = "upload"
             upload(auth, local, filename, subfolder=target_folder)
+            openlist_cache[target_folder][filename] = actual
             local.unlink(missing_ok=True)
             success += 1
             log(f"[{index}/{len(songs)}] 上传完成：{filename}")
         except Exception as exc:
             local.unlink(missing_ok=True)
+            final_local.unlink(missing_ok=True)
             failed.append(label)
             failed_details.append({
                 "title": original.get("title", ""),
