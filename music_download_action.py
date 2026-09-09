@@ -751,8 +751,9 @@ def netease_search(title, artist):
     return None
 
 
-def find_source(song):
-    """先使用发现该歌曲的音源，失败后按循环顺序尝试其余音源。"""
+def find_source(song, excluded_sources=None):
+    """先使用发现该歌曲的音源；解析或实际下载失败时可排除已失败音源。"""
+    excluded = set(excluded_sources or ())
     source_funcs = {
         "QQ aa.cab": qq_primary_search,
         "QQ tang.api.s01s.cn": qq_search,
@@ -767,6 +768,8 @@ def find_source(song):
         ordered_sources = source_order
 
     for source in ordered_sources:
+        if source in excluded:
+            continue
         func = source_funcs[source]
         try:
             if func is qq_primary_search:
@@ -782,6 +785,29 @@ def find_source(song):
         except Exception as exc:
             log(f"{source} 搜索失败，准备尝试下一个音源：{exc}")
     return None
+
+
+def download_audio(found, local, index, total_count):
+    """下载音频；HTTP 404/413 等错误交给调用方切换音源或记录失败。"""
+    r = http_request("GET", found["url"], headers=SOURCE_HEADERS, stream=True, timeout=300)
+    r.raise_for_status()
+    total = int(r.headers.get("content-length", 0) or found.get("size", 0) or 0)
+    downloaded = 0
+    last_report = time.monotonic()
+    with local.open("wb") as handle:
+        for chunk in r.iter_content(1024 * 1024):
+            if chunk:
+                handle.write(chunk)
+                downloaded += len(chunk)
+                now = time.monotonic()
+                if now - last_report >= 3:
+                    if total:
+                        percent = downloaded * 100 / total
+                        log(f"[{index}/{total_count}] 下载进度：{downloaded / 1048576:.2f}/{total / 1048576:.2f} MiB ({percent:.1f}%)")
+                    else:
+                        log(f"[{index}/{total_count}] 已下载：{downloaded / 1048576:.2f} MiB")
+                    last_report = now
+    return local.stat().st_size
 
 
 def netease_metadata(title, artist):
@@ -1174,25 +1200,26 @@ def main():
         local = work / base_filename
         stage = "download"
         try:
-            r = http_request("GET", found["url"], headers=SOURCE_HEADERS, stream=True, timeout=300)
-            r.raise_for_status()
-            total = int(r.headers.get("content-length", 0) or found.get("size", 0) or 0)
-            downloaded = 0
-            last_report = time.monotonic()
-            with local.open("wb") as handle:
-                for chunk in r.iter_content(1024 * 1024):
-                    if chunk:
-                        handle.write(chunk)
-                        downloaded += len(chunk)
-                        now = time.monotonic()
-                        if now - last_report >= 3:
-                            if total:
-                                percent = downloaded * 100 / total
-                                log(f"[{index}/{len(songs)}] 下载进度：{downloaded / 1048576:.2f}/{total / 1048576:.2f} MiB ({percent:.1f}%)")
-                            else:
-                                log(f"[{index}/{len(songs)}] 已下载：{downloaded / 1048576:.2f} MiB")
-                            last_report = now
-            actual = local.stat().st_size
+            attempted_sources = set()
+            while True:
+                attempted_sources.add(str(found.get("source", "unknown")))
+                try:
+                    actual = download_audio(found, local, index, len(songs))
+                    break
+                except Exception as download_exc:
+                    local.unlink(missing_ok=True)
+                    failed_source = str(found.get("source", "unknown"))
+                    log(f"[{index}/{len(songs)}] 下载失败：音源={failed_source}，原因={download_exc}；准备切换下一个音源")
+                    next_found = find_source(original, excluded_sources=attempted_sources)
+                    if not next_found:
+                        raise
+                    found = next_found
+                    filename_title = safe_name(str(found.get("filename_title") or original["title"]).strip())
+                    extension = str(found.get("extension") or Path(str(found.get("filename") or "")).suffix.lstrip(".") or "flac").lower()
+                    base_filename = safe_name(f"{filename_title} {original['artist']}.{extension}")
+                    local = work / base_filename
+                    log(f"[{index}/{len(songs)}] 切换音源：{found['source']}")
+
             log(f"[{index}/{len(songs)}] 下载完成：{actual / 1048576:.2f} MiB，上传前检查 AList 目录文件")
             if found["size"] and abs(actual - found["size"]) > SIZE_TOLERANCE:
                 raise RuntimeError(f"体积异常 {actual}/{found['size']}")
