@@ -42,6 +42,9 @@ MB_API = "https://musicbrainz.org/ws/2"
 MB_HEADERS = {"User-Agent": "music-download-action/1.0 (n8n workflow)"}
 LASTFM_API = "https://ws.audioscrobbler.com/2.0/"
 SOURCE_HEADERS = {"User-Agent": "Mozilla/5.0", "Accept": "application/json,text/plain,*/*"}
+HTTP_SESSION = requests.Session()
+HTTP_SESSION.headers.update(SOURCE_HEADERS)
+DEFAULT_HTTP_TIMEOUT = 60
 RETRIES = 3
 RETRY_INTERVAL = 10
 SOURCE_TIMEOUT = 12
@@ -81,12 +84,13 @@ def fail(message):
 
 
 def http_request(method, url, **kwargs):
-    """所有 HTTP 请求统一最多尝试 3 次，失败间隔 10 秒。"""
+    """通过复用 Session 统一处理请求头、超时和有限重试。"""
     retry_count = kwargs.pop("_retry_count", RETRIES)
+    kwargs.setdefault("timeout", DEFAULT_HTTP_TIMEOUT)
     error = None
     for attempt in range(1, retry_count + 1):
         try:
-            response = requests.request(method, url, **kwargs)
+            response = HTTP_SESSION.request(method, url, **kwargs)
             status = getattr(response, "status_code", 0)
             if status == 429 or status >= 500:
                 response.close()
@@ -542,8 +546,6 @@ def discover_songs(mode, query):
         if not song["title"] or not one_artist(artists):
             continue
         keys = identity_keys(song)
-        if not song["title"] or not one_artist(artists):
-            continue
         if any(key in seen for key in keys):
             continue
         seen.update(keys)
@@ -815,6 +817,7 @@ def netease_metadata(title, artist):
     try:
         title_rows = []
         seen_urls = set()
+        selected = None
         for search_text in (f"{title} {artist}", title):
             rows = request_json(
                 NETEASE_API,
@@ -843,7 +846,7 @@ def netease_metadata(title, artist):
         else:
             selected = None
 
-        if 'selected' not in locals() or selected is None:
+        if selected is None:
             selected = title_rows[0] if len(title_rows) == 1 else None
         if selected is None:
             log(f"网易云未匹配到歌曲信息：{title} - {artist}")
@@ -972,7 +975,12 @@ def safe_name(value):
     # 挂载存储对撇号和反斜杠的转义不一致，文件名统一去除这两类字符。
     value = str(value).replace("/'", "'").replace("\\'", "'").replace('\\"', '"')
     value = value.replace("'", "").replace("\\", "")
-    value = re.sub(r'[/:*?"<>|\x00-\x1f]', "_", value).strip().rstrip(" .")
+    # 过滤 Windows 保留符号、C0/C1 控制符、零宽字符及 BOM；
+    # NFKC 归一化后再检查，兼容全角输入和跨平台挂载路径。
+    value = unicodedata.normalize("NFKC", value)
+    value = re.sub(r'[/:*?"<>|\x00-\x1f\x7f-\x9f\u200b-\u200d\u2060\ufeff]', "_", value)
+    value = re.sub(r"[\u2028\u2029]", "_", value)
+    value = re.sub(r"_+", "_", value).strip(" ._").rstrip(" .")
     return (value or "unknown")[:180]
 
 
