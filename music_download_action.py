@@ -1034,11 +1034,12 @@ def safe_name(value):
 
 
 def openlist_auth():
-    required = ["OPENLIST_URL", "OPENLIST_TOKEN"]
-    missing = [key for key in required if not os.getenv(key)]
+    url = os.getenv("OPENLIST_URL") or os.getenv("ALIST_URL")
+    token = os.getenv("OPENLIST_TOKEN") or os.getenv("ALIST_TOKEN")
+    missing = [name for name, value in (("OPENLIST_URL", url), ("OPENLIST_TOKEN", token)) if not value]
     if missing:
         fail("缺少 OpenList Secret: " + ", ".join(missing))
-    return (os.environ["OPENLIST_URL"].rstrip("/"), os.environ["OPENLIST_TOKEN"])
+    return (url.rstrip("/"), token)
 
 
 def openlist_headers(auth, extra=None):
@@ -1049,7 +1050,7 @@ def openlist_headers(auth, extra=None):
 
 
 def openlist_file_path(filename=None, subfolder=None):
-    base = (os.getenv("OPENLIST_PATH") or "/cd18/Music").strip("/")
+    base = (os.getenv("OPENLIST_PATH") or os.getenv("ALIST_PATH") or "/cd18/Music").strip("/")
     parts = [part for part in base.split("/") if part]
     if subfolder:
         parts.append(safe_name(str(subfolder).strip("/")))
