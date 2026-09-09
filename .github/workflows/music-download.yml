@@ -19,9 +19,9 @@ jobs:
     timeout-minutes: 360
     env:
       PYTHONUNBUFFERED: '1'
-      ALIST_URL: ${{ secrets.ALIST_URL }}
-      ALIST_TOKEN: ${{ secrets.ALIST_TOKEN }}
-      ALIST_PATH: ${{ secrets.ALIST_PATH }}
+      OPENLIST_URL: ${{ secrets.OPENLIST_URL || vars.OPENLIST_URL || secrets.ALIST_URL || vars.ALIST_URL }}
+      OPENLIST_TOKEN: ${{ secrets.OPENLIST_TOKEN || vars.OPENLIST_TOKEN || secrets.ALIST_TOKEN || vars.ALIST_TOKEN }}
+      OPENLIST_PATH: ${{ secrets.OPENLIST_PATH || vars.OPENLIST_PATH || secrets.ALIST_PATH || vars.ALIST_PATH }}
       LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
     steps:
       - name: Checkout repository
