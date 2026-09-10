@@ -798,6 +798,10 @@ def find_source(song, excluded_sources=None):
             else:
                 item = func(song["title"], song["artist"])
             if item:
+                resolved_title = item.get("filename_title") or item.get("title") or item.get("filename", "")
+                if EXCLUDE_DJ and is_dj_variant(resolved_title):
+                    log(f"{source} 解析到 DJ 版本，按 --DJ 排除：{resolved_title}")
+                    continue
                 source_breaker_success(source)
                 merged = {**item, **song}
                 merged["platform_ids"] = {**item.get("platform_ids", {}), **song.get("platform_ids", {})}
