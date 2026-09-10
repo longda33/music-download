@@ -59,12 +59,12 @@ SOURCE_BREAKER = {}
 
 
 def parse_download_query(value):
-    """解析末尾 —all 和 —DJ；只移除控制参数，不改变歌曲名内部的短横线。"""
+    """解析末尾 --all 和 --DJ；只移除控制参数，不改变歌曲名内部的短横线。"""
     text = str(value or "").strip()
-    suffix = re.search(r"(?:(?:—all|—dj))+$", text, flags=re.IGNORECASE)
+    suffix = re.search(r"(?:(?:--all|--dj))+$", text, flags=re.IGNORECASE)
     suffix_text = suffix.group(0) if suffix else ""
-    allow_non_flac = bool(re.search(r"—all", suffix_text, flags=re.IGNORECASE))
-    exclude_dj = bool(re.search(r"—dj", suffix_text, flags=re.IGNORECASE))
+    allow_non_flac = bool(re.search(r"--all", suffix_text, flags=re.IGNORECASE))
+    exclude_dj = bool(re.search(r"--dj", suffix_text, flags=re.IGNORECASE))
     text = text[:-len(suffix_text)].strip() if suffix_text else text
     return text, allow_non_flac, exclude_dj
 
