@@ -597,9 +597,8 @@ def qq_primary_search(title, artist, index=1):
     row_title = str(row.get("song") or row.get("song_name") or "").strip()
     row_artist = str(row.get("singer") or row.get("artist") or "").strip()
     music = str(row.get("music") or row.get("url") or "").strip()
-    artist_parts = [part.strip() for part in re.split(r"[,，/&、]+", row_artist) if part.strip()]
     if (canonical_title(row_title) != canonical_title(title)
-            or not any(artists_match(part, artist) for part in artist_parts)
+            or not artists_match(row_artist, artist)
             or not music):
         return None
     if not ALLOW_NON_FLAC and not music.lower().split("?")[0].endswith(".flac"):
