@@ -52,17 +52,26 @@ SOURCE_TIMEOUT = 12
 DETAIL_TIMEOUT = 8
 SIZE_TOLERANCE = 3 * 1024 * 1024
 ALLOW_NON_FLAC = False
+EXCLUDE_DJ = False
 SOURCE_BREAKER_THRESHOLD = 2
 SOURCE_BREAKER_COOLDOWN = 120
 SOURCE_BREAKER = {}
 
 
 def parse_download_query(value):
-    """解析末尾 -all；只移除控制参数，不改变歌曲名内部的短横线。"""
+    """解析末尾 —all 和 —DJ；只移除控制参数，不改变歌曲名内部的短横线。"""
     text = str(value or "").strip()
-    if re.search(r"(?i)-all$", text):
-        return re.sub(r"(?i)-all$", "", text).strip(), True
-    return text, False
+    suffix = re.search(r"(?:(?:—all|—dj))+$", text, flags=re.IGNORECASE)
+    suffix_text = suffix.group(0) if suffix else ""
+    allow_non_flac = bool(re.search(r"—all", suffix_text, flags=re.IGNORECASE))
+    exclude_dj = bool(re.search(r"—dj", suffix_text, flags=re.IGNORECASE))
+    text = text[:-len(suffix_text)].strip() if suffix_text else text
+    return text, allow_non_flac, exclude_dj
+
+
+def is_dj_variant(title):
+    """排除标题末尾明确标注为 DJ 的版本。"""
+    return bool(re.search(r"(?:^|[\s\-—（(])dj(?:版|remix)?(?:[）)]|$)", str(title or ""), flags=re.IGNORECASE))
 
 
 def log(message):
@@ -536,6 +545,8 @@ def discover_songs(mode, query):
     seen = set()
     result = []
     for song in songs:
+        if EXCLUDE_DJ and is_dj_variant(song.get("title", "")):
+            continue
         if mode == "search":
             parts = query_terms(query)
             if len(parts) >= 2:
@@ -1126,36 +1137,44 @@ def upload(auth, local_path, filename, subfolder=None):
     encoded_path = quote(path, safe="/")
     content_type = mimetypes.guess_type(str(local_path))[0] or "application/octet-stream"
     headers = openlist_headers(auth, {"File-Path": encoded_path, "Content-Length": str(expected), "Content-Type": content_type, "As-Task": "false"})
-    with local_path.open("rb") as handle:
-        r = http_request("PUT", openlist_api(auth, "put"), headers=headers, data=handle, timeout=600)
-    try:
-        data = r.json()
-    except ValueError as exc:
-        raise RuntimeError(f"OpenList 上传返回非 JSON：HTTP {r.status_code}") from exc
-    if r.status_code >= 400 or data.get("code") != 200:
-        # 部分挂载盘会先完成写入，再因解析远端时间失败而返回错误。
-        # 只有按文件名和大小确认远端文件存在时，才将此类响应计为成功。
-        last_observed = None
-        for attempt in range(3):
-            if attempt:
-                time.sleep(RETRY_INTERVAL)
+    last_error = None
+    response = None
+    data = None
+    # 上传请求失败后必须重新打开文件；复用已读取过的 file handle 会导致重试发送空内容。
+    # connection reset 通常发生在 OpenList 挂载适配器或反向代理中，重试前先独立确认是否已写入。
+    for attempt in range(1, RETRIES + 1):
+        try:
+            with local_path.open("rb") as handle:
+                response = http_request("PUT", openlist_api(auth, "put"), headers=headers, data=handle, timeout=600, _retry_count=1)
             try:
-                files = openlist_listing(auth, subfolder=subfolder)
-                last_observed = files.get(filename)
-                if filename in files and last_observed and abs(last_observed - expected) <= SIZE_TOLERANCE:
-                    log(f"OpenList 返回错误，但远程文件已确认存在：{filename}")
-                    return
-            except Exception as verify_exc:
-                last_observed = f"确认接口异常：{verify_exc}"
-        message = data.get("message", data) if isinstance(data, dict) else data
-        if last_observed is not None:
-            log(f"OpenList 上传后确认未通过：文件={filename}，远程大小={last_observed}，本地大小={expected}")
-        # 挂载盘已写入文件，但 OpenList 在构造响应时解析非标准时间失败。
-        # 该特征错误发生在写入之后；目录接口也可能继承同一时间解析问题。
-        if isinstance(message, str) and message.startswith("parsing time "):
-            log(f"OpenList 返回时间解析错误，按文件已提交处理：{filename}")
-            return
-        raise RuntimeError(f"OpenList 上传失败：{message}")
+                data = response.json()
+            except ValueError:
+                data = None
+            if response.status_code < 400 and isinstance(data, dict) and data.get("code") == 200:
+                return
+            message = data.get("message", data) if isinstance(data, dict) else f"HTTP {response.status_code}，返回非 JSON"
+            last_error = RuntimeError(f"OpenList 上传失败：{message}")
+        except Exception as exc:
+            last_error = exc
+            log(f"OpenList 上传连接异常（第 {attempt}/{RETRIES} 次）：{exc}")
+
+        try:
+            files = openlist_listing(auth, subfolder=subfolder)
+            observed = files.get(filename)
+            if filename in files and observed and abs(observed - expected) <= SIZE_TOLERANCE:
+                log(f"OpenList 上传请求异常，但远程文件已确认存在：{filename}")
+                return
+        except Exception as verify_exc:
+            log(f"OpenList 上传后确认失败：{verify_exc}")
+        if attempt < RETRIES:
+            time.sleep(RETRY_INTERVAL * attempt)
+
+    # 某些挂载盘写入完成后会因解析远端时间失败而返回错误；仅对该明确特征保留兼容处理。
+    message = data.get("message", data) if isinstance(data, dict) else str(last_error)
+    if isinstance(message, str) and message.startswith("parsing time "):
+        log(f"OpenList 返回时间解析错误，按文件已提交处理：{filename}")
+        return
+    raise RuntimeError(f"OpenList 上传失败：{message}") from last_error
 
 
 def callback(payload):
@@ -1186,9 +1205,10 @@ def main():
         fail("EVENT_PAYLOAD 为空")
     payload = json.loads(raw) if isinstance(raw, str) else raw
     ACTIVE_PAYLOAD = payload
-    query, query_all = parse_download_query(payload.get("query", ""))
-    global ALLOW_NON_FLAC
+    query, query_all, query_exclude_dj = parse_download_query(payload.get("query", ""))
+    global ALLOW_NON_FLAC, EXCLUDE_DJ
     ALLOW_NON_FLAC = bool(payload.get("allow_non_flac") or query_all)
+    EXCLUDE_DJ = bool(payload.get("exclude_dj") or query_exclude_dj)
     mode = payload.get("mode", "singer")
     if not query:
         fail("缺少 query")
