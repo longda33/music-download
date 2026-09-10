@@ -70,8 +70,10 @@ def parse_download_query(value):
 
 
 def is_dj_variant(title):
-    """排除标题末尾明确标注为 DJ 的版本。"""
-    return bool(re.search(r"(?:^|[\s\-—（(])dj(?:版|remix)?(?:[）)]|$)", str(title or ""), flags=re.IGNORECASE))
+    """用 Unicode 归一化和独立 DJ 词元识别版本，不枚举 DJ 版本名称。"""
+    normalized = unicodedata.normalize("NFKC", str(title or "")).casefold()
+    # DJ 作为独立英文词元即可判定为 DJ 标识；不会误匹配 adjust、djmix 等普通词。
+    return bool(re.search(r"(?<![a-z0-9])dj(?![a-z0-9])", normalized))
 
 
 def log(message):
