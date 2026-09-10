@@ -61,7 +61,7 @@ SOURCE_BREAKER = {}
 def parse_download_query(value):
     """解析末尾 --all 和 --DJ；只移除控制参数，不改变歌曲名内部的短横线。"""
     text = str(value or "").strip()
-    suffix = re.search(r"(?:(?:--all|--dj))+$", text, flags=re.IGNORECASE)
+    suffix = re.search(r"(?:(?:\s*--all|\s*--dj))+$", text, flags=re.IGNORECASE)
     suffix_text = suffix.group(0) if suffix else ""
     allow_non_flac = bool(re.search(r"--all", suffix_text, flags=re.IGNORECASE))
     exclude_dj = bool(re.search(r"--dj", suffix_text, flags=re.IGNORECASE))
@@ -1050,6 +1050,14 @@ def safe_name(value):
     return (value or "unknown")[:180]
 
 
+def safe_filename(title_and_artist, extension):
+    """限制主文件名长度，同时保留完整扩展名。"""
+    ext = str(extension or "flac").lstrip(".").lower()
+    stem = safe_name(title_and_artist)
+    max_stem = max(1, 180 - len(ext) - 1)
+    return f"{stem[:max_stem].rstrip(' ._')}.{ext}"
+
+
 def openlist_auth():
     url = os.getenv("OPENLIST_URL") or os.getenv("ALIST_URL")
     token = os.getenv("OPENLIST_TOKEN") or os.getenv("ALIST_TOKEN")
@@ -1102,7 +1110,9 @@ def openlist_listing(auth, subfolder=None):
     if data.get("code") != 200:
         raise RuntimeError(f"OpenList 列目录失败：{data.get('message', data)}")
     result = {}
-    for item in (data.get("data") or {}).get("content", []) or []:
+    listing_data = data.get("data")
+    content = listing_data.get("content", []) if isinstance(listing_data, dict) else []
+    for item in content or []:
         if isinstance(item, dict) and item.get("name"):
             raw_size = item.get("size")
             try:
@@ -1283,7 +1293,7 @@ def main():
             openlist_cache[target_folder] = openlist_listing(auth, subfolder=target_folder)
         log(f"[{index}/{len(songs)}] 目标文件夹：{target_folder}")
         extension = str(found.get("extension") or Path(str(found.get("filename") or "")).suffix.lstrip(".") or "flac").lower()
-        base_filename = safe_name(f"{filename_title} {original['artist']}.{extension}")
+        base_filename = safe_filename(f"{filename_title} {original['artist']}", extension)
         final_local = work / base_filename
         local = final_local.with_name(final_local.name + ".tmp")
         stage = "download"
@@ -1305,7 +1315,7 @@ def main():
                     found = next_found
                     filename_title = safe_name(str(found.get("filename_title") or original["title"]).strip())
                     extension = str(found.get("extension") or Path(str(found.get("filename") or "")).suffix.lstrip(".") or "flac").lower()
-                    base_filename = safe_name(f"{filename_title} {original['artist']}.{extension}")
+                    base_filename = safe_filename(f"{filename_title} {original['artist']}", extension)
                     final_local = work / base_filename
                     local = final_local.with_name(final_local.name + ".tmp")
                     log(f"[{index}/{len(songs)}] 切换音源：{found['source']}")
