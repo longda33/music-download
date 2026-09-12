@@ -84,34 +84,32 @@ def _metadata_value(*values):
     return ""
 
 
-def candidate_info_score(item):
-    """同音源重复候选中，信息越完整分数越高。"""
+def candidate_variant_penalty(item):
+    """识别非普通专辑发行的版本标记；仅用于同源候选优先级。"""
     if not isinstance(item, dict):
-        return (0, 0, 0)
-    fields = ("album_name", "album", "version", "subtitle", "filename", "album_mid")
-    present = sum(bool(_metadata_value(item.get(field))) for field in fields)
-    detail_length = sum(len(_metadata_value(item.get(field))) for field in fields)
-    has_ids = sum(bool(_metadata_value(value)) for value in (item.get("platform_ids") or {}).values())
-    return (present, has_ids, detail_length)
-
-
-def candidate_is_live_variant(item):
-    """判断候选是否为现场/演唱会版本；仅用于同源候选优先级，不作为 DJ 判据。"""
-    if not isinstance(item, dict):
-        return False
+        return 0
     text = " ".join(
         _metadata_value(item.get(field))
         for field in ("title", "song", "song_name", "filename_title", "album_name", "album", "filename", "version", "subtitle")
     )
     text = unicodedata.normalize("NFKC", text).casefold()
+    strong = r"(?:\blive\b|\bconcert\b|\bunplugged\b|\bremix\b|\bedit\b|\bradio\b|\bextended\b|\bclub\b|\bdemo\b|\bacoustic\b|\binstrumental\b|\bkaraoke\b|\bversion\b|现场|演唱会|演唱會|音乐会|音樂會|伴奏|重制|重製|修复|修復|改编|改編|网络版|網絡版|特别版|特別版|混音|纯音乐|純音樂|翻唱|串烧|串燒|合唱版|剪辑版|剪輯版|快手版|抖音版|铃声版|鈴聲版|DJ)"
+    return 1 if re.search(strong, text) else 0
+
+
+def candidate_is_live_variant(item):
+    """兼容旧调用：返回候选是否为现场类变体。"""
+    if not isinstance(item, dict):
+        return False
+    text = " ".join(_metadata_value(item.get(field)) for field in ("title", "song", "song_name", "filename_title", "album_name", "album", "filename", "version", "subtitle"))
+    text = unicodedata.normalize("NFKC", text).casefold()
     return bool(re.search(r"(?:\blive\b|\bconcert\b|\bunplugged\b|现场|演唱会|演唱會|音乐会|音樂會)", text))
 
 
 def candidate_selection_key(item):
-    """同源候选选择：录音室/正式专辑优先，其次才比较信息完整度。"""
+    """同源候选选择：只按普通/变体优先级和稳定顺序，不按元数据完整度筛选。"""
     return (
-        candidate_is_live_variant(item),
-        tuple(-value for value in candidate_info_score(item)),
+        candidate_variant_penalty(item),
         int((item.get("platform_ids") or {}).get("qq_primary_n") or 10**9),
     )
 
