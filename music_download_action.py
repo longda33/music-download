@@ -95,6 +95,27 @@ def candidate_info_score(item):
     return (present, has_ids, detail_length)
 
 
+def candidate_is_live_variant(item):
+    """判断候选是否为现场/演唱会版本；仅用于同源候选优先级，不作为 DJ 判据。"""
+    if not isinstance(item, dict):
+        return False
+    text = " ".join(
+        _metadata_value(item.get(field))
+        for field in ("title", "song", "song_name", "filename_title", "album_name", "album", "filename", "version", "subtitle")
+    )
+    text = unicodedata.normalize("NFKC", text).casefold()
+    return bool(re.search(r"(?:\blive\b|\bconcert\b|\bunplugged\b|现场|演唱会|演唱會|音乐会|音樂會)", text))
+
+
+def candidate_selection_key(item):
+    """同源候选选择：录音室/正式专辑优先，其次才比较信息完整度。"""
+    return (
+        candidate_is_live_variant(item),
+        tuple(-value for value in candidate_info_score(item)),
+        int((item.get("platform_ids") or {}).get("qq_primary_n") or 10**9),
+    )
+
+
 def is_dj_variant(title_or_version_text, artist_name=""):
     """仅在版本相关字段中识别独立 DJ 词元，避免误杀 DJ Snake 等艺人。"""
     text = unicodedata.normalize("NFKC", str(title_or_version_text or "")).casefold()
@@ -779,14 +800,10 @@ def qq_primary_discover(query):
     for item in result:
         identity = (canonical_title(item.get("title", "")), canonical_artist(item.get("artist", "")))
         previous = best_by_identity.get(identity)
-        if previous is None or candidate_info_score(item) > candidate_info_score(previous):
+        if previous is None or candidate_selection_key(item) < candidate_selection_key(previous):
             best_by_identity[identity] = item
     result = list(best_by_identity.values())
-    result.sort(key=lambda item: (
-        not bool(item.get("album_name")),
-        -candidate_info_score(item)[0],
-        int((item.get("platform_ids") or {}).get("qq_primary_n") or 10**9),
-    ))
+    result.sort(key=candidate_selection_key)
     return result
 
 
@@ -922,9 +939,11 @@ def find_source(song, excluded_sources=None):
         "网易云": netease_search,
         "酷我": kuwo_search,
     }
-    source_order = ["QQ aa.cab", "QQ tang.api.s01s.cn", "网易云", "酷我"]
+    source_order = ["QQ tang.api.s01s.cn", "网易云", "酷我", "QQ aa.cab"]
     preferred = song.get("discovery_source")
     if preferred in source_order:
+        # 筛选后的候选来自哪个接口，就优先从哪个接口解析和下载。
+        # 只有该接口失败，才按统一后备顺序切换其他接口。
         ordered_sources = [preferred] + [source for source in source_order if source != preferred]
     else:
         ordered_sources = source_order
