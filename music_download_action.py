@@ -899,10 +899,13 @@ def find_source(song, excluded_sources=None):
                 source_breaker_success(source)
                 # 源音源字段优先；发现目录只补充源音源没有返回的字段。
                 merged = {**song, **item}
-                for field in ("title", "artist", "album", "album_name", "filename_title", "filename", "version", "subtitle", "cover_url", "lyric_url", "lyrics", "isrc", "year"):
+                # 仅补充下载音源没有返回的非版本字段；专辑/版本不能借用目录候选。
+                for field in ("title", "artist", "isrc", "year"):
                     if not _metadata_value(item.get(field)) and _metadata_value(song.get(field)):
                         merged[field] = song[field]
-                merged["album_name"] = item_album or expected_album
+                merged["album_name"] = item_album
+                if expected_album and not item_album:
+                    merged["discovery_album_name"] = expected_album
                 merged["platform_ids"] = {**song.get("platform_ids", {}), **item.get("platform_ids", {})}
                 if source == "QQ aa.cab":
                     if EXCLUDE_DJ:
