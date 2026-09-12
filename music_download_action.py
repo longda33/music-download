@@ -632,9 +632,25 @@ def qq_primary_result(query, index=1):
 
 
 def qq_primary_search(title, artist, index=1):
-    """优先使用新 QQ 接口，精确获取指定结果的 SQ 无损地址。"""
+    """优先使用新 QQ 接口，并在最终解析前重新选择同源最佳候选。"""
     query = f"{title} {artist}"
-    row = qq_primary_result(query, index)
+    # 不能盲信发现阶段传入的 num：上游可能来自旧缓存或旧版本目录结果。
+    # 最终下载前重新读取同源候选，确保同歌名/歌手优先选择信息最完整的一条。
+    selected_index = index
+    try:
+        refreshed = qq_primary_discover(query)
+        matching = [
+            item for item in refreshed
+            if canonical_title(item.get("title", "")) == canonical_title(title)
+            and canonical_artist(item.get("artist", "")) == canonical_artist(artist)
+        ]
+        if matching:
+            selected_index = int((matching[0].get("platform_ids") or {}).get("qq_primary_n") or index)
+            if selected_index != index:
+                log(f"QQ aa.cab 最终解析重新选择同源最佳候选：num={index} -> num={selected_index}")
+    except Exception as exc:
+        log(f"QQ aa.cab 最终候选刷新失败，暂使用原候选 num={index}：{exc}")
+    row = qq_primary_result(query, selected_index)
     if not row:
         return None
     row_title = str(row.get("song") or row.get("song_name") or "").strip()
