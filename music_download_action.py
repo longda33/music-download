@@ -870,7 +870,10 @@ def find_source(song, excluded_sources=None):
                 merged["album_name"] = item_album or expected_album
                 merged["platform_ids"] = {**song.get("platform_ids", {}), **item.get("platform_ids", {})}
                 if source == "QQ aa.cab":
-                    log(f"--DJ 候选已通过元数据检查：num={(merged.get('platform_ids') or {}).get('qq_primary_n')}，mid={(merged.get('platform_ids') or {}).get('qq_primary_mid')}，专辑={merged.get('album_name') or '未知'}")
+                    if EXCLUDE_DJ:
+                        log(f"--DJ 候选已通过元数据检查：num={(merged.get('platform_ids') or {}).get('qq_primary_n')}，mid={(merged.get('platform_ids') or {}).get('qq_primary_mid')}，专辑={merged.get('album_name') or '未知'}")
+                    else:
+                        log(f"QQ aa.cab 候选已解析：num={(merged.get('platform_ids') or {}).get('qq_primary_n')}，mid={(merged.get('platform_ids') or {}).get('qq_primary_mid')}，专辑={merged.get('album_name') or '未知'}")
                 log(f"音源解析：使用 {source}，已成功解析")
                 return merged
         except Exception as exc:
