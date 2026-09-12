@@ -681,6 +681,7 @@ def qq_primary_search(title, artist, index=1):
         "source": "QQ aa.cab",
         "quality": "标准音质" if ALLOW_NON_FLAC else "SQ无损",
         "platform_ids": {
+            "qq_primary_n": selected_index,
             "qq_primary_mid": row.get("mid"),
             "qq_primary_media_mid": row.get("media_mid"),
             "qq_primary_album_mid": row.get("album_mid"),
