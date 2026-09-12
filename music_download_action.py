@@ -56,6 +56,10 @@ EXCLUDE_DJ = False
 SOURCE_BREAKER_THRESHOLD = 2
 SOURCE_BREAKER_COOLDOWN = 120
 SOURCE_BREAKER = {}
+DISCOVERY_SERVICE_DISABLED = set()
+DISCOVERY_SERVICE_NOTICE = set()
+DISCOVERY_RETRIES = 1
+DISCOVERY_TIMEOUT = 20
 
 
 def parse_download_query(value):
@@ -192,21 +196,55 @@ def one_artist(credit):
 
 
 def mb_get(path, params):
+    if "musicbrainz" in DISCOVERY_SERVICE_DISABLED:
+        raise RuntimeError("MusicBrainz 本次任务已熔断")
     time.sleep(1.1)
-    return request_json(f"{MB_API}/{path}", params={**params, "fmt": "json"}, headers=MB_HEADERS)
+    try:
+        return request_json(
+            f"{MB_API}/{path}",
+            params={**params, "fmt": "json"},
+            headers=MB_HEADERS,
+            timeout=DISCOVERY_TIMEOUT,
+            retries=DISCOVERY_RETRIES,
+        )
+    except Exception as exc:
+        DISCOVERY_SERVICE_DISABLED.add("musicbrainz")
+        if "musicbrainz" not in DISCOVERY_SERVICE_NOTICE:
+            DISCOVERY_SERVICE_NOTICE.add("musicbrainz")
+            log(f"MusicBrainz 暂不可用，本次任务跳过后续请求：{exc}")
+        raise
 
 
 def lastfm_get(method, params):
+    if "lastfm" in DISCOVERY_SERVICE_DISABLED:
+        raise RuntimeError("Last.fm 本次任务已熔断")
     api_key = os.getenv("LASTFM_API_KEY")
     if not api_key:
-        fail("缺少 LASTFM_API_KEY")
+        DISCOVERY_SERVICE_DISABLED.add("lastfm")
+        if "lastfm" not in DISCOVERY_SERVICE_NOTICE:
+            DISCOVERY_SERVICE_NOTICE.add("lastfm")
+            log("未配置 LASTFM_API_KEY，本次任务跳过 Last.fm 补充发现")
+        raise RuntimeError("缺少 LASTFM_API_KEY")
     query = {"method": method, "api_key": api_key, "format": "json", **params}
-    r = http_request("GET", LASTFM_API, params=query, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("error"):
-        raise RuntimeError(f"Last.fm API 错误 {data['error']}: {data.get('message', '')}")
-    return data
+    try:
+        r = http_request(
+            "GET",
+            LASTFM_API,
+            params=query,
+            timeout=DISCOVERY_TIMEOUT,
+            _retry_count=DISCOVERY_RETRIES,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("error"):
+            raise RuntimeError(f"Last.fm API 错误 {data['error']}: {data.get('message', '')}")
+        return data
+    except Exception as exc:
+        DISCOVERY_SERVICE_DISABLED.add("lastfm")
+        if "lastfm" not in DISCOVERY_SERVICE_NOTICE:
+            DISCOVERY_SERVICE_NOTICE.add("lastfm")
+            log(f"Last.fm 暂不可用，本次任务跳过后续请求：{exc}")
+        raise
 
 
 def lastfm_recording(row):
@@ -1351,6 +1389,9 @@ def callback(payload):
 
 def main():
     global ACTIVE_PAYLOAD
+    DISCOVERY_SERVICE_DISABLED.clear()
+    DISCOVERY_SERVICE_NOTICE.clear()
+    SOURCE_BREAKER.clear()
     raw = os.getenv("EVENT_PAYLOAD", "")
     if not raw:
         fail("EVENT_PAYLOAD 为空")
