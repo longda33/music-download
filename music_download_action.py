@@ -1197,16 +1197,42 @@ def openlist_api(auth, endpoint):
 
 
 def ensure_openlist_folder(auth, subfolder=None):
+    """创建并验证 OpenList 目录；不能只依赖 mkdir 的返回码。"""
     path = openlist_file_path(subfolder=subfolder)
-    r = http_request("POST", openlist_api(auth, "mkdir"), headers=openlist_headers(auth, {"Content-Type": "application/json"}), json={"path": path}, timeout=60)
-    if r.status_code >= 400:
+    last_error = None
+    for attempt in range(1, RETRIES + 1):
         try:
-            data = r.json()
-        except ValueError:
-            data = {}
-        # OpenList 已存在目录时返回错误，后续 list/put 仍可正常进行。
-        if data.get("code") not in (200, 400):
-            r.raise_for_status()
+            r = http_request(
+                "POST",
+                openlist_api(auth, "mkdir"),
+                headers=openlist_headers(auth, {"Content-Type": "application/json"}),
+                json={"path": path},
+                timeout=60,
+            )
+            try:
+                data = r.json()
+            except ValueError:
+                data = {}
+            api_code = data.get("code") if isinstance(data, dict) else None
+            if r.status_code >= 400 and api_code not in (200, 400):
+                r.raise_for_status()
+            # OpenList 已存在目录时可能返回 400；必须通过 list 验证，而不是直接放行。
+            verify = http_request(
+                "POST",
+                openlist_api(auth, "list"),
+                headers=openlist_headers(auth, {"Content-Type": "application/json"}),
+                json={"path": path, "password": "", "page": 1, "per_page": 1, "refresh": True},
+                timeout=60,
+            )
+            verify_data = verify.json()
+            if verify.status_code < 400 and isinstance(verify_data, dict) and verify_data.get("code") == 200:
+                return
+            last_error = RuntimeError(f"OpenList 目录验证失败：{verify_data}")
+        except Exception as exc:
+            last_error = exc
+        if attempt < RETRIES:
+            time.sleep(RETRY_INTERVAL * attempt)
+    raise RuntimeError(f"OpenList 目录不存在或创建失败：{path}；原因={last_error}") from last_error
 
 
 def openlist_listing(auth, subfolder=None):
@@ -1254,6 +1280,8 @@ def choose_filename(auth, base_filename, size, subfolder=None, files=None):
 
 def upload(auth, local_path, filename, subfolder=None):
     filename = safe_name(filename)
+    # 上传前再次确认目标目录，避免 mkdir 异步未生效或目录被删除。
+    ensure_openlist_folder(auth, subfolder=subfolder)
     path = openlist_file_path(filename, subfolder=subfolder)
     expected = local_path.stat().st_size
     log(f"OpenList API 上传：{filename}")
