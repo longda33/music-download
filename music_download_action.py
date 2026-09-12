@@ -80,6 +80,17 @@ def _metadata_value(*values):
     return ""
 
 
+def candidate_info_score(item):
+    """同音源重复候选中，信息越完整分数越高。"""
+    if not isinstance(item, dict):
+        return (0, 0, 0)
+    fields = ("album_name", "album", "version", "subtitle", "filename", "album_mid")
+    present = sum(bool(_metadata_value(item.get(field))) for field in fields)
+    detail_length = sum(len(_metadata_value(item.get(field))) for field in fields)
+    has_ids = sum(bool(_metadata_value(value)) for value in (item.get("platform_ids") or {}).values())
+    return (present, has_ids, detail_length)
+
+
 def is_dj_variant(title_or_version_text, artist_name=""):
     """仅在版本相关字段中识别独立 DJ 词元，避免误杀 DJ Snake 等艺人。"""
     text = unicodedata.normalize("NFKC", str(title_or_version_text or "")).casefold()
@@ -101,7 +112,7 @@ def validate_candidate_dj_status(item, artist_hint="", require_context=True):
         return False, "检测到 DJ 标记"
     has_version_context = any(values[field] for field in ("album_name", "album", "version", "subtitle"))
     if EXCLUDE_DJ and require_context and not has_version_context:
-        return False, "版本信息不足"
+        return True, "版本信息不足，无法确认 DJ（不作为 DJ 排除依据）"
     return True, "OK"
 
 
@@ -694,10 +705,33 @@ def qq_primary_discover(query):
             continue
         seen.add(key)
         index = int(row.get("num") or position)
-        result.append({"title": title, "artist": artist, "album_name": album_name, "album_mid": row.get("album_mid"), "platform_ids": {"qq_primary_n": index, "qq_primary_mid": row.get("mid"), "qq_primary_media_mid": row.get("media_mid"), "qq_primary_album_mid": row.get("album_mid")}, "artist_ids": [], "recording_id": None, "isrc": None, "year": None})
-    # 信息完整的精确候选优先；接口序号只作为稳定的次级排序，避免无专辑信息的后续重混版抢先。
-    if EXCLUDE_DJ:
-        result.sort(key=lambda item: (not bool(item.get("album_name")), int((item.get("platform_ids") or {}).get("qq_primary_n") or 10**9)))
+        result.append({
+            "title": title,
+            "artist": artist,
+            "album_name": album_name,
+            "album_mid": row.get("album_mid"),
+            "filename": row.get("filename"),
+            "version": row.get("version"),
+            "subtitle": row.get("subtitle"),
+            "platform_ids": {"qq_primary_n": index, "qq_primary_mid": row.get("mid"), "qq_primary_media_mid": row.get("media_mid"), "qq_primary_album_mid": row.get("album_mid")},
+            "artist_ids": [],
+            "recording_id": None,
+            "isrc": row.get("isrc"),
+            "year": row.get("year"),
+        })
+    # 同一音源中歌名和歌手完全相同的重复结果，只保留信息最完整的一条。
+    best_by_identity = {}
+    for item in result:
+        identity = (canonical_title(item.get("title", "")), canonical_artist(item.get("artist", "")))
+        previous = best_by_identity.get(identity)
+        if previous is None or candidate_info_score(item) > candidate_info_score(previous):
+            best_by_identity[identity] = item
+    result = list(best_by_identity.values())
+    result.sort(key=lambda item: (
+        not bool(item.get("album_name")),
+        -candidate_info_score(item)[0],
+        int((item.get("platform_ids") or {}).get("qq_primary_n") or 10**9),
+    ))
     return result
 
 
@@ -856,11 +890,12 @@ def find_source(song, excluded_sources=None):
                     if not safe:
                         log(f"--DJ 跳过音源候选：音源={source}，原因={reason}，歌曲={song.get('title')} - {song.get('artist')}")
                         continue
+                    if reason != "OK":
+                        log(f"--DJ 版本信息提示：音源={source}，{reason}，歌曲={song.get('title')} - {song.get('artist')}")
                 item_album = _metadata_value(item.get("album_name"), item.get("album"))
                 expected_album = _metadata_value(song.get("album_name"), song.get("album"))
                 if EXCLUDE_DJ and expected_album and item_album and canonical_title(item_album) != canonical_title(expected_album):
-                    log(f"--DJ 跳过专辑与目录候选不一致的音源：音源={source}，目录专辑={expected_album}，音源专辑={item_album}")
-                    continue
+                    log(f"--DJ 版本信息不一致，以下载音源字段为准：音源={source}，目录专辑={expected_album}，音源专辑={item_album}")
                 source_breaker_success(source)
                 # 源音源字段优先；发现目录只补充源音源没有返回的字段。
                 merged = {**song, **item}
@@ -871,7 +906,10 @@ def find_source(song, excluded_sources=None):
                 merged["platform_ids"] = {**song.get("platform_ids", {}), **item.get("platform_ids", {})}
                 if source == "QQ aa.cab":
                     if EXCLUDE_DJ:
-                        log(f"--DJ 候选已通过元数据检查：num={(merged.get('platform_ids') or {}).get('qq_primary_n')}，mid={(merged.get('platform_ids') or {}).get('qq_primary_mid')}，专辑={merged.get('album_name') or '未知'}")
+                        if reason == "OK":
+                            log(f"--DJ 候选已通过明确版本信息检查：num={(merged.get('platform_ids') or {}).get('qq_primary_n')}，mid={(merged.get('platform_ids') or {}).get('qq_primary_mid')}，专辑={merged.get('album_name') or '未知'}")
+                        else:
+                            log(f"--DJ 候选未发现明确 DJ 标记，版本信息不足：num={(merged.get('platform_ids') or {}).get('qq_primary_n')}，mid={(merged.get('platform_ids') or {}).get('qq_primary_mid')}，专辑={merged.get('album_name') or '未知'}")
                     else:
                         log(f"QQ aa.cab 候选已解析：num={(merged.get('platform_ids') or {}).get('qq_primary_n')}，mid={(merged.get('platform_ids') or {}).get('qq_primary_mid')}，专辑={merged.get('album_name') or '未知'}")
                 log(f"音源解析：使用 {source}，已成功解析")
