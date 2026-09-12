@@ -454,16 +454,6 @@ def platform_discover(query):
                    for t, a in pair_terms)
 
     try:
-        for row in qq_primary_discover(lookup_query):
-            title, artist = row.get("title"), row.get("artist")
-            if accept(title, artist):
-                row["_exact_match"] = exact_accept(title, artist)
-                row["discovery_source"] = "QQ aa.cab"
-                candidates.append(row)
-    except Exception as exc:
-        log(f"新 QQ 实时目录搜索失败：{exc}")
-
-    try:
         rows = request_json(QQ_API, {"msg": lookup_query, "type": "json"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=RETRIES)
         for row in rows if isinstance(rows, list) else []:
             title = row.get("song_title") or row.get("song_name")
