@@ -355,8 +355,17 @@ def canonical_title(value):
 
 
 def dedup_title(value):
-    """用于去重：Live/现场后缀与原版视为同一首歌，显示标题不改变。"""
+    """用于去重：移除明确的版本/影视插曲后缀，显示标题不改变。"""
     text = unicodedata.normalize("NFKC", str(value or "")).strip()
+    # “情歌-《败犬女王》电视剧插曲”等平台说明不是歌曲身份的一部分。
+    text = re.sub(
+        r"\s*[-－–—]?\s*(?:[（(]\s*)?《[^》]+》\s*"
+        r"(?:电视剧|微电影|电影)?(?:插曲|主题曲|片尾曲|原声带)"
+        r"(?:\s*[）)])?\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    ).strip()
     # 只移除明确位于标题末尾的 Live/现场标识，避免误合并不同歌曲。
     text = re.sub(
         r"(?:\s*[-－–—]?\s*(?:[（(]\s*)?(?:live|现场版?|live版)(?:\s*[）)])?\s*)$",
@@ -477,7 +486,7 @@ def identity_keys(song):
         keys.append(("isrc", dedup_key(song["isrc"])))
     if song.get("recording_id"):
         keys.append(("recording", str(song["recording_id"]).casefold()))
-    title_key = canonical_title(song.get("title", ""))
+    title_key = dedup_title(song.get("title", ""))
     for artist_id in song.get("artist_ids", []):
         if artist_id:
             keys.append(("artist-id-title", str(artist_id).casefold(), title_key))
