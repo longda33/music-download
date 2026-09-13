@@ -97,6 +97,35 @@ def candidate_variant_penalty(item):
     return 1 if re.search(strong, text) else 0
 
 
+def candidate_size_bytes(item):
+    """读取不同音源候选的文件体积，供同名候选选择专辑大文件。"""
+    if not isinstance(item, dict):
+        return 0
+    values = (
+        item.get("size"), item.get("song_size_sq"), item.get("song_size_sq_str"),
+        item.get("song_size_flac"), item.get("song_size_flac_str"),
+        item.get("file_size"), item.get("filesize"),
+    )
+    for value in values:
+        if value in (None, ""):
+            continue
+        try:
+            return int(float(str(value).replace(",", "").strip()))
+        except (TypeError, ValueError):
+            match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*(B|K|KB|KiB|M|MB|MiB|G|GB|GiB)", str(value), re.I)
+            if match:
+                number, unit = float(match.group(1)), match.group(2).lower()
+                return int(number * {"b": 1, "k": 1024, "kb": 1024, "kib": 1024, "m": 1024**2, "mb": 1024**2, "mib": 1024**2, "g": 1024**3, "gb": 1024**3, "gib": 1024**3}[unit])
+    return 0
+
+
+def candidate_missing_album_penalty(item):
+    """专辑字段为空的候选优先级靠后，避免无专辑结果抢走正式专辑版。"""
+    if not isinstance(item, dict):
+        return 1
+    return 0 if _metadata_value(item.get("album_name"), item.get("album")) else 1
+
+
 def candidate_is_live_variant(item):
     """兼容旧调用：返回候选是否为现场类变体。"""
     if not isinstance(item, dict):
@@ -107,9 +136,11 @@ def candidate_is_live_variant(item):
 
 
 def candidate_selection_key(item):
-    """同源候选选择：只按普通/变体优先级和稳定顺序，不按元数据完整度筛选。"""
+    """同源候选选择：版本标记、有效专辑字段优先；体积仅作最后辅助。"""
     return (
         candidate_variant_penalty(item),
+        candidate_missing_album_penalty(item),
+        -candidate_size_bytes(item),
         int((item.get("platform_ids") or {}).get("qq_primary_n") or 10**9),
     )
 
@@ -361,6 +392,14 @@ def is_title_variant(title, query):
     return any(marker in suffix for marker in VERSION_MARKERS)
 
 
+def title_matches_query(title, query):
+    """标题匹配：允许明确标记的同曲版本，保留源返回的版本标识。"""
+    return (
+        canonical_title(title) == canonical_title(query)
+        or is_title_variant(title, query)
+    )
+
+
 def normalize_folder_label(value):
     """生成稳定的文件夹名，消除括号、空格和全角字符造成的重复目录。"""
     text = unicodedata.normalize("NFKC", to_simplified(str(value or ""))).strip()
@@ -456,7 +495,7 @@ def platform_discover(query):
             return True
         return any(
             artists_match(artist, a)
-            and (canonical_title(title) == canonical_title(t) or is_title_variant(title, t))
+            and title_matches_query(title, t)
             for t, a in pair_terms
         )
 
@@ -467,7 +506,7 @@ def platform_discover(query):
             return False
         if len(parts) == 1:
             return True
-        return any(canonical_title(title) == canonical_title(t)
+        return any(title_matches_query(title, t)
                    or artists_match(artist, a)
                    for t, a in pair_terms)
 
@@ -528,14 +567,12 @@ def exact_pair_match(song, query):
     parts = query_terms(query)
     if len(parts) < 2:
         return True
-    title = canonical_title(song.get("title", ""))
+    title = str(song.get("title", ""))
     artist = str(song.get("artist", ""))
     for cut in range(1, len(parts)):
         left, right = " ".join(parts[:cut]), " ".join(parts[cut:])
-        if ((artists_match(artist, right)
-             and (title == canonical_title(left) or is_title_variant(song.get("title", ""), left)))
-                or (artists_match(artist, left)
-                    and (title == canonical_title(right) or is_title_variant(song.get("title", ""), right)))):
+        if ((artists_match(artist, right) and title_matches_query(title, left))
+                or (artists_match(artist, left) and title_matches_query(title, right))):
             return True
     return False
 
@@ -550,10 +587,8 @@ def space_pair_match(song, query):
     for cut in range(1, len(raw_parts)):
         left = " ".join(raw_parts[:cut])
         right = " ".join(raw_parts[cut:])
-        if ((artists_match(artist, right)
-             and (canonical_title(title) == canonical_title(left) or is_title_variant(title, left)))
-                or (artists_match(artist, left)
-                    and (canonical_title(title) == canonical_title(right) or is_title_variant(title, right)))):
+        if ((artists_match(artist, right) and title_matches_query(title, left))
+                or (artists_match(artist, left) and title_matches_query(title, right))):
             return True
     return False
 
@@ -810,6 +845,7 @@ def qq_primary_discover(query):
             "filename": row.get("filename"),
             "version": row.get("version"),
             "subtitle": row.get("subtitle"),
+            "size": row.get("size") or row.get("file_size") or row.get("filesize"),
             "platform_ids": {"qq_primary_n": index, "qq_primary_mid": row.get("mid"), "qq_primary_media_mid": row.get("media_mid"), "qq_primary_album_mid": row.get("album_mid")},
             "artist_ids": [],
             "recording_id": None,
@@ -840,6 +876,7 @@ def qq_search(title, artist):
         and artists_match(row.get("singer_name") or row.get("singer") or "", artist)
     ]
     candidate_rows.sort(key=candidate_selection_key)
+    resolved = []
     for row in candidate_rows:
         if not isinstance(row, dict) or not row.get("song_mid"):
             continue
@@ -864,8 +901,8 @@ def qq_search(title, artist):
             filename = detail.get(f"song_filename_{tier}")
             if url and filename and (ALLOW_NON_FLAC or str(filename).lower().endswith(".flac")):
                 extension = Path(urlparse(str(url)).path).suffix.lower().lstrip(".") or Path(str(filename)).suffix.lower().lstrip(".") or "mp3"
-                return {"url": url, "filename": filename, "filename_title": source_title, "artist": detail_artist, "album_name": str(detail.get("album_name") or detail.get("album") or row.get("album_name") or "").strip(), "size": int(detail.get(f"song_size_{tier}_str") or 0), "source": "QQ tang.api.s01s.cn", "quality": label, "extension": extension, "platform_ids": {"qq_song_id": detail.get("song_id"), "qq_song_mid": detail.get("song_mid") or row.get("song_mid"), "qq_singer_id": detail.get("singer_id"), "qq_singer_mid": detail.get("singer_mid")}}
-    return None
+                resolved.append({"url": url, "filename": filename, "filename_title": source_title, "artist": detail_artist, "album_name": str(detail.get("album_name") or detail.get("album") or row.get("album_name") or "").strip(), "size": int(detail.get(f"song_size_{tier}_str") or 0), "source": "QQ tang.api.s01s.cn", "quality": label, "extension": extension, "platform_ids": {"qq_song_id": detail.get("song_id"), "qq_song_mid": detail.get("song_mid") or row.get("song_mid"), "qq_singer_id": detail.get("singer_id"), "qq_singer_mid": detail.get("singer_mid")}})
+    return min(resolved, key=candidate_selection_key) if resolved else None
 
 
 def recursive_flac(value):
@@ -1457,7 +1494,7 @@ def main():
         fail("缺少 query")
     log(f"开始任务：mode={mode}, query={query}, allow_non_flac={ALLOW_NON_FLAC}, exclude_dj={EXCLUDE_DJ}")
     songs = discover_songs(mode, query)
-    log(f"目录检索完成：共 {len(songs)} 首，歌曲名-歌手名支持同曲 Live、现场、伴奏、Remix 等明确版本，五人及以上合唱已过滤")
+    log(f"目录检索完成：共 {len(songs)} 首，同名候选优先普通专辑版并按文件体积选择较大音频，五人及以上合唱已过滤")
     if not songs:
         message = "未搜索到歌曲，请检查输入的歌曲名称或歌手名称是否正确。"
         log(message)
