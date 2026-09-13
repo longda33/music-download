@@ -11,6 +11,7 @@ import signal
 import sys
 import time
 import unicodedata
+from collections import Counter
 from pathlib import Path
 from urllib.parse import quote, parse_qs, urlparse
 
@@ -60,6 +61,24 @@ DISCOVERY_SERVICE_DISABLED = set()
 DISCOVERY_SERVICE_NOTICE = set()
 DISCOVERY_RETRIES = 1
 DISCOVERY_TIMEOUT = 20
+
+SEARCH_PROMPT = "请输入要下载的歌曲关键词"
+HELP_TEXT = """请输入要下载的歌曲关键词
+
+支持三种方式：
+• 歌曲名-歌手名，例如：稻香-周杰伦
+• 仅歌曲名，例如：稻香
+• 仅歌手名，例如：周杰伦
+
+下载规则：
+• 默认只下载 FLAC SQ
+• 发送 /s 开始搜索
+• 发送 /help 查看完整帮助
+• 发送 /cancel 取消搜索
+• 发送 /stop 停止当前下载任务
+• 在关键词末尾添加 --all，解除 FLAC SQ 格式限制
+• 在关键词末尾添加 --dj，排除 DJ/混音/现场等版本
+"""
 
 
 def parse_download_query(value):
@@ -190,6 +209,18 @@ signal.signal(signal.SIGINT, handle_cancel)
 
 def fail(message):
     raise RuntimeError(message)
+
+
+def failure_reason_summary(details):
+    """失败回调只保留原因和数量，不泄露失败歌曲名称。"""
+    counts = Counter()
+    for detail in details or []:
+        if isinstance(detail, dict):
+            reason = str(detail.get("error") or "未知失败原因").strip()
+        else:
+            reason = str(detail or "未知失败原因").strip()
+        counts[reason or "未知失败原因"] += 1
+    return [{"error": reason, "count": count} for reason, count in counts.items()]
 
 
 def http_request(method, url, **kwargs):
@@ -1493,8 +1524,11 @@ def callback(payload):
         "cancelled": payload.get("cancelled", False),
         "success_count": payload.get("success_count", 0),
         "skipped_count": payload.get("skipped_count", 0),
-        "failed_songs": payload.get("failed_songs", []),
+        "failed_count": payload.get("failed_count", 0),
+        "failed_songs": [],
         "failed_details": payload.get("failed_details", []),
+        "search_prompt": payload.get("search_prompt", SEARCH_PROMPT),
+        "help_text": payload.get("help_text", HELP_TEXT),
         "error": payload.get("error", ""),
     }
     http_request("POST", url, headers=headers, json=result, timeout=30).raise_for_status()
@@ -1527,6 +1561,7 @@ def main():
         payload["cancelled"] = False
         payload["success_count"] = 0
         payload["skipped_count"] = 0
+        payload["failed_count"] = 0
         payload["failed_songs"] = []
         payload["failed_details"] = []
         payload["error"] = message
@@ -1652,12 +1687,16 @@ def main():
     log(f"任务完成：上传 {success} 首，跳过 {skipped} 首，失败 {len(failed)} 首")
     payload["success_count"] = success
     payload["skipped_count"] = skipped
-    payload["failed_songs"] = failed
-    payload["failed_details"] = failed_details
+    payload["failed_count"] = len(failed)
+    # 对外仅传递“失败原因 + 数量”；歌曲名只保留在本次 Action 日志中。
+    payload["failed_songs"] = []
+    payload["failed_details"] = failure_reason_summary(failed_details)
+    payload["search_prompt"] = SEARCH_PROMPT
+    payload["help_text"] = HELP_TEXT
     payload["status"] = "completed"
     payload["cancelled"] = False
     callback(payload)
-    print(json.dumps({"status": "completed", "success_count": success, "skipped_count": skipped, "failed_songs": failed, "failed_details": failed_details}, ensure_ascii=False))
+    print(json.dumps({"status": "completed", "success_count": success, "skipped_count": skipped, "failed_count": len(failed), "failed_songs": [], "failed_details": failure_reason_summary(failed_details), "search_prompt": SEARCH_PROMPT, "help_text": HELP_TEXT}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
@@ -1671,8 +1710,12 @@ if __name__ == "__main__":
             ACTIVE_PAYLOAD["cancelled"] = False
             ACTIVE_PAYLOAD["error"] = message
             ACTIVE_PAYLOAD.setdefault("success_count", 0)
+            ACTIVE_PAYLOAD.setdefault("failed_count", 1)
             ACTIVE_PAYLOAD.setdefault("failed_songs", [])
-            ACTIVE_PAYLOAD.setdefault("failed_details", [{"title": "", "artist": "", "stage": "task", "source": "", "error": message}])
+            ACTIVE_PAYLOAD["failed_songs"] = []
+            ACTIVE_PAYLOAD["failed_details"] = failure_reason_summary([{"error": message}])
+            ACTIVE_PAYLOAD["search_prompt"] = SEARCH_PROMPT
+            ACTIVE_PAYLOAD["help_text"] = HELP_TEXT
             try:
                 callback(ACTIVE_PAYLOAD)
                 log("异常状态已回调 n8n")
