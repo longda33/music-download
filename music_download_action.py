@@ -90,7 +90,7 @@ def candidate_variant_penalty(item):
         return 0
     text = " ".join(
         _metadata_value(item.get(field))
-        for field in ("title", "song", "song_name", "filename_title", "album_name", "album", "filename", "version", "subtitle")
+        for field in ("title", "song", "song_title", "song_name", "filename_title", "album_name", "album", "filename", "version", "subtitle")
     )
     text = unicodedata.normalize("NFKC", text).casefold()
     strong = r"(?:\blive\b|\bconcert\b|\bunplugged\b|\bremix\b|\bedit\b|\bradio\b|\bextended\b|\bclub\b|\bdemo\b|\bacoustic\b|\binstrumental\b|\bkaraoke\b|\bversion\b|现场|演唱会|演唱會|音乐会|音樂會|伴奏|重制|重製|修复|修復|改编|改編|网络版|網絡版|特别版|特別版|混音|纯音乐|純音樂|翻唱|串烧|串燒|合唱版|剪辑版|剪輯版|快手版|抖音版|铃声版|鈴聲版|DJ)"
@@ -101,7 +101,7 @@ def candidate_is_live_variant(item):
     """兼容旧调用：返回候选是否为现场类变体。"""
     if not isinstance(item, dict):
         return False
-    text = " ".join(_metadata_value(item.get(field)) for field in ("title", "song", "song_name", "filename_title", "album_name", "album", "filename", "version", "subtitle"))
+    text = " ".join(_metadata_value(item.get(field)) for field in ("title", "song", "song_title", "song_name", "filename_title", "album_name", "album", "filename", "version", "subtitle"))
     text = unicodedata.normalize("NFKC", text).casefold()
     return bool(re.search(r"(?:\blive\b|\bconcert\b|\bunplugged\b|现场|演唱会|演唱會|音乐会|音樂會)", text))
 
@@ -375,28 +375,25 @@ def normalize_folder_label(value):
     return text or "unknown"
 
 
-def artists_match(left, right):
-    """使用归一化、包含关系和相似度识别艺人，不依赖规则表或别名穷举。"""
-    left_key, right_key = canonical_artist(left), canonical_artist(right)
-    if not left_key or not right_key:
+def extract_artist_tokens(value):
+    """拆分中英文艺人标记，支持 Rosy赵露思 和合唱信息，不使用别名表。"""
+    raw = unicodedata.normalize("NFKC", to_simplified(str(value or ""))).casefold()
+    parts = re.split(r"[&+/、,，;；|]+|\bfeat\.?|\bft\.?|\bfeaturing\b", raw)
+    tokens = set()
+    for part in parts:
+        tokens.update(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+|[a-z0-9]+", part))
+    return {token for token in tokens if len(token) > 1}
+
+
+def artists_match(candidate_artist, query_artist):
+    """匹配艺人：单艺人查询允许候选为合唱；多艺人查询必须精确覆盖。"""
+    candidate_tokens = extract_artist_tokens(candidate_artist)
+    query_tokens = extract_artist_tokens(query_artist)
+    if not candidate_tokens or not query_tokens:
         return False
-    if left_key == right_key:
-        return True
-    # 仅对单一艺人做模糊判断，避免把合作艺人列表错误合并。
-    if "&" in left_key or "&" in right_key:
-        return False
-    # 中文艺人名可能带英文艺名或平台前缀，例如 Rosy赵露思；
-    # 两个以上汉字的包含关系可作为单一艺人匹配，避免被长度阈值误过滤。
-    if (left_key in right_key or right_key in left_key):
-        shorter_text = left_key if len(left_key) <= len(right_key) else right_key
-        if len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", shorter_text)) >= 2:
-            return True
-    shorter = min(len(left_key), len(right_key))
-    if shorter < 4:
-        return False
-    if left_key in right_key or right_key in left_key:
-        return True
-    return difflib.SequenceMatcher(None, left_key, right_key).ratio() >= 0.92
+    if len(query_tokens) == 1:
+        return next(iter(query_tokens)) in candidate_tokens
+    return candidate_tokens == query_tokens
 
 
 def artist_folder_name(value, related=None):
@@ -695,7 +692,7 @@ def qq_primary_search(title, artist, index=1):
         matching = [
             item for item in refreshed
             if canonical_title(item.get("title", "")) == canonical_title(title)
-            and canonical_artist(item.get("artist", "")) == canonical_artist(artist)
+            and artists_match(item.get("artist", ""), artist)
         ]
         if matching:
             selected_index = int((matching[0].get("platform_ids") or {}).get("qq_primary_n") or index)
@@ -806,14 +803,21 @@ def qq_search(title, artist):
     rows = request_json(QQ_API, {"msg": f"{title} {artist}", "type": "json"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=RETRIES)
     if not isinstance(rows, list):
         return None
-    for row in rows[:3]:
+    candidate_rows = [
+        row for row in rows
+        if isinstance(row, dict)
+        and canonical_title(row.get("song_title") or row.get("song_name") or "") == canonical_title(title)
+        and artists_match(row.get("singer_name") or row.get("singer") or "", artist)
+    ]
+    candidate_rows.sort(key=candidate_selection_key)
+    for row in candidate_rows:
         if not isinstance(row, dict) or not row.get("song_mid"):
             continue
         row_title = str(row.get("song_title") or row.get("song_name") or "").strip()
         row_artist = str(row.get("singer_name") or row.get("singer") or "").strip()
         if canonical_title(row_title) != canonical_title(title):
             continue
-        if canonical_artist(row_artist) != canonical_artist(artist):
+        if not artists_match(row_artist, artist):
             continue
         detail = request_json(QQ_API, {"msg": f"{title} {artist}", "type": "json", "mid": row["song_mid"]}, SOURCE_HEADERS, timeout=DETAIL_TIMEOUT, retries=RETRIES)
         detail_title = str(detail.get("song_title") or detail.get("song_name") or "").strip()
@@ -822,7 +826,7 @@ def qq_search(title, artist):
             log(f"QQ 详情缺少歌曲名或歌手名，跳过：{row_title} - {row_artist}")
             continue
         source_title = detail_title
-        if canonical_title(source_title) != canonical_title(title) or canonical_artist(detail_artist) != canonical_artist(artist):
+        if canonical_title(source_title) != canonical_title(title) or not artists_match(detail_artist, artist):
             log(f"QQ 结果与目标不一致，跳过：{source_title} - {detail_artist}")
             continue
         for tier, label in (("sq", "SQ"), ("pq", "PQ")):
@@ -830,7 +834,7 @@ def qq_search(title, artist):
             filename = detail.get(f"song_filename_{tier}")
             if url and filename and (ALLOW_NON_FLAC or str(filename).lower().endswith(".flac")):
                 extension = Path(urlparse(str(url)).path).suffix.lower().lstrip(".") or Path(str(filename)).suffix.lower().lstrip(".") or "mp3"
-                return {"url": url, "filename": filename, "filename_title": source_title, "album_name": str(detail.get("album_name") or detail.get("album") or row.get("album_name") or "").strip(), "size": int(detail.get(f"song_size_{tier}_str") or 0), "source": "QQ tang.api.s01s.cn", "quality": label, "extension": extension, "platform_ids": {"qq_song_id": detail.get("song_id"), "qq_song_mid": detail.get("song_mid") or row.get("song_mid"), "qq_singer_id": detail.get("singer_id"), "qq_singer_mid": detail.get("singer_mid")}}
+                return {"url": url, "filename": filename, "filename_title": source_title, "artist": detail_artist, "album_name": str(detail.get("album_name") or detail.get("album") or row.get("album_name") or "").strip(), "size": int(detail.get(f"song_size_{tier}_str") or 0), "source": "QQ tang.api.s01s.cn", "quality": label, "extension": extension, "platform_ids": {"qq_song_id": detail.get("song_id"), "qq_song_mid": detail.get("song_mid") or row.get("song_mid"), "qq_singer_id": detail.get("singer_id"), "qq_singer_mid": detail.get("singer_mid")}}
     return None
 
 
@@ -866,7 +870,9 @@ def kuwo_search(title, artist):
         factor = {"b": 1, "kib": 1024, "kb": 1024, "mib": 1024**2, "mb": 1024**2, "gib": 1024**3, "gb": 1024**3}[unit]
         return int(number * factor)
 
-    for index, row in enumerate(rows, 1):
+    indexed_rows = [(index, row) for index, row in enumerate(rows, 1) if isinstance(row, dict)]
+    indexed_rows.sort(key=lambda pair: candidate_selection_key({**pair[1], "title": pair[1].get("song"), "artist": pair[1].get("singer"), "platform_ids": {"source_index": pair[0]}}))
+    for index, row in indexed_rows:
         if not isinstance(row, dict):
             continue
         if canonical_title(row.get("song", "")) != canonical_title(title):
@@ -894,15 +900,17 @@ def kuwo_search(title, artist):
         fmt = str(item.get("format", "")).lower() if isinstance(item, dict) else ""
         if url and (ALLOW_NON_FLAC or (fmt == "flac" and str(url).lower().split("?")[0].endswith(".flac"))):
             extension = Path(urlparse(str(url)).path).suffix.lower().lstrip(".") or fmt or "mp3"
-            return {"url": url, "filename": f"{title}.{extension}", "filename_title": detail_title, "album_name": str(item.get("album_name") or item.get("album") or row.get("album_name") or row.get("album") or "").strip(), "size": size_bytes(item.get("size", "")), "source": "酷我", "quality": f"{fmt.upper() or 'AUDIO'} {item.get('bitrate', '')}kbps", "extension": extension, "platform_ids": {"kuwo_id": item.get("id"), "kuwo_rid": item.get("rid") or row.get("rid")}}
+            return {"url": url, "filename": f"{title}.{extension}", "filename_title": detail_title, "artist": detail_artist, "album_name": str(item.get("album_name") or item.get("album") or row.get("album_name") or row.get("album") or "").strip(), "size": size_bytes(item.get("size", "")), "source": "酷我", "quality": f"{fmt.upper() or 'AUDIO'} {item.get('bitrate', '')}kbps", "extension": extension, "platform_ids": {"kuwo_id": item.get("id"), "kuwo_rid": item.get("rid") or row.get("rid")}}
     return None
 
 
 def netease_search(title, artist):
     data = request_json(NETEASE_API, {"type": "search", "id": f"{title} {artist}", "limit": 10, "page": 1, "server": "netease"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=RETRIES)
-    for row in (data if isinstance(data, list) else []):
+    indexed_rows = [(index, row) for index, row in enumerate(data if isinstance(data, list) else [], 1) if isinstance(row, dict)]
+    indexed_rows.sort(key=lambda pair: candidate_selection_key({**pair[1], "title": pair[1].get("name"), "artist": pair[1].get("artist"), "platform_ids": {"source_index": pair[0]}}))
+    for _, row in indexed_rows:
         row_title, row_artist = row.get("name", ""), row.get("artist", "")
-        if canonical_title(row_title) != canonical_title(title) or canonical_artist(row_artist) != canonical_artist(artist):
+        if canonical_title(row_title) != canonical_title(title) or not artists_match(row_artist, artist):
             continue
         search_url = row.get("url", "")
         song_id = parse_qs(urlparse(search_url).query).get("id", [""])[0]
@@ -918,7 +926,7 @@ def netease_search(title, artist):
             probe.close()
             if ALLOW_NON_FLAC or is_flac:
                 extension = Path(urlparse(probe.url).path).suffix.lower().lstrip(".") or ("flac" if is_flac else "mp3")
-                return {"url": download_url, "filename": f"{title}.{extension}", "filename_title": str(row_title).strip(), "album_name": str(row.get("album") or "").strip(), "size": size, "source": "网易云", "quality": "FLAC" if is_flac else "标准音质", "extension": extension, "album": str(row.get("album") or "").strip(), "cover_url": str(row.get("pic") or "").strip(), "lyric_url": str(row.get("lrc") or "").strip(), "platform_ids": {"netease_song_id": song_id, "netease_cover_id": parse_qs(urlparse(str(row.get("pic") or "")).query).get("id", [""])[0]}}
+                return {"url": download_url, "filename": f"{title}.{extension}", "filename_title": str(row_title).strip(), "artist": str(row_artist).strip(), "album_name": str(row.get("album") or "").strip(), "size": size, "source": "网易云", "quality": "FLAC" if is_flac else "标准音质", "extension": extension, "album": str(row.get("album") or "").strip(), "cover_url": str(row.get("pic") or "").strip(), "lyric_url": str(row.get("lrc") or "").strip(), "platform_ids": {"netease_song_id": song_id, "netease_cover_id": parse_qs(urlparse(str(row.get("pic") or "")).query).get("id", [""])[0]}}
         except Exception:
             pass
     return None
@@ -1480,7 +1488,7 @@ def main():
             openlist_cache[target_folder] = openlist_listing(auth, subfolder=target_folder)
         log(f"[{index}/{len(songs)}] 目标文件夹：{target_folder}")
         extension = str(found.get("extension") or Path(str(found.get("filename") or "")).suffix.lstrip(".") or "flac").lower()
-        base_filename = safe_filename(f"{filename_title} {original['artist']}", extension)
+        base_filename = safe_filename(f"{filename_title} {found.get('artist') or original['artist']}", extension)
         final_local = work / base_filename
         local = final_local.with_name(final_local.name + ".tmp")
         stage = "download"
@@ -1502,7 +1510,7 @@ def main():
                     found = next_found
                     filename_title = safe_name(str(found.get("filename_title") or original["title"]).strip())
                     extension = str(found.get("extension") or Path(str(found.get("filename") or "")).suffix.lstrip(".") or "flac").lower()
-                    base_filename = safe_filename(f"{filename_title} {original['artist']}", extension)
+                    base_filename = safe_filename(f"{filename_title} {found.get('artist') or original['artist']}", extension)
                     final_local = work / base_filename
                     local = final_local.with_name(final_local.name + ".tmp")
                     log(f"[{index}/{len(songs)}] 切换音源：{found['source']}")
