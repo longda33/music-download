@@ -424,14 +424,24 @@ def extract_artist_tokens(value):
     return {token for token in tokens if len(token) > 1}
 
 
+def _close_artist_token(candidate, query):
+    """艺人平台字形误差容忍：仅限短中文单艺人且最多一个字不同。"""
+    if candidate == query or len(candidate) != len(query) or not 1 < len(query) <= 4:
+        return candidate == query
+    if not all(re.fullmatch(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", ch) for ch in candidate + query):
+        return False
+    return sum(left != right for left, right in zip(candidate, query)) <= 1
+
+
 def artists_match(candidate_artist, query_artist):
-    """匹配艺人：单艺人查询允许候选为合唱；多艺人查询必须精确覆盖。"""
+    """匹配艺人：允许短中文单艺人一个字的录入差异；合作艺人仍精确覆盖。"""
     candidate_tokens = extract_artist_tokens(candidate_artist)
     query_tokens = extract_artist_tokens(query_artist)
     if not candidate_tokens or not query_tokens:
         return False
     if len(query_tokens) == 1:
-        return next(iter(query_tokens)) in candidate_tokens
+        query_token = next(iter(query_tokens))
+        return any(_close_artist_token(token, query_token) for token in candidate_tokens)
     return candidate_tokens == query_tokens
 
 
@@ -1017,6 +1027,7 @@ def find_source(song, excluded_sources=None):
     else:
         ordered_sources = source_order
 
+    fallback_items = []
     for source in ordered_sources:
         if source in excluded or source_breaker_open(source):
             continue
@@ -1036,6 +1047,13 @@ def find_source(song, excluded_sources=None):
                     if reason != "OK":
                         log(f"--DJ 版本信息提示：音源={source}，{reason}，歌曲={song.get('title')} - {song.get('artist')}")
                 item_album = _metadata_value(item.get("album_name"), item.get("album"))
+                # 歌手目录搜索没有 discovery_source 时，不能因某个音源先返回
+                # 无专辑候选就停止；继续比较其他音源，优先拿到正式专辑版本。
+                if not preferred and not item_album:
+                    fallback_items.append(item)
+                    source_breaker_success(source)
+                    log(f"音源解析：{source} 返回无专辑候选，继续比较其他音源")
+                    continue
                 expected_album = _metadata_value(song.get("album_name"), song.get("album"))
                 if EXCLUDE_DJ and expected_album and item_album and canonical_title(item_album) != canonical_title(expected_album):
                     log(f"--DJ 版本信息不一致，以下载音源字段为准：音源={source}，目录专辑={expected_album}，音源专辑={item_album}")
@@ -1063,6 +1081,10 @@ def find_source(song, excluded_sources=None):
         except Exception as exc:
             source_breaker_failure(source, exc)
             log(f"{source} 搜索失败，准备尝试下一个音源：{exc}")
+    if fallback_items:
+        selected = min(fallback_items, key=candidate_selection_key)
+        log(f"未找到有效专辑字段，使用无专辑后备候选：{selected.get('source', 'unknown')}")
+        return selected
     return None
 
 
