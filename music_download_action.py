@@ -334,10 +334,12 @@ def dedup_title(value):
 
 
 def query_terms(query):
-    """仅按第一个半角短横线分隔歌曲名和歌手名，避免空格造成歧义。"""
+    """按第一个常见横线分隔歌曲名和歌手名，避免空格造成歧义。"""
     query = str(query or "").strip()
-    if "-" in query:
-        title, artist = query.split("-", 1)
+    # 兼容用户直接输入或 Telegram 富文本带来的全角/长横线。
+    match = re.search(r"[-－–—]", query)
+    if match:
+        title, artist = query[:match.start()], query[match.end():]
         title, artist = title.strip(), artist.strip()
         if title and artist:
             return [title, artist]
