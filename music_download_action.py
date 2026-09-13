@@ -397,9 +397,18 @@ def artists_match(candidate_artist, query_artist):
 
 
 def artist_folder_name(value, related=None):
-    """生成稳定的艺人文件夹名称，不依赖别名文件。"""
-    key = canonical_artist(value)
-    return normalize_folder_label(ARTIST_FOLDER_NAMES.get(key) or value)
+    """生成稳定的主艺人目录名；不把平台前缀/英文别名写入目录。"""
+    value = str(value or "").strip()
+    related = str(related or "").strip()
+    # 用户输入的中文主艺人名优先作为目录标签，避免源返回 Rosy赵露思 时建重复目录。
+    if related and re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", related):
+        value = related
+    else:
+        # 单一中文艺人名从平台前缀中提取：Rosy赵露思、JJ林俊杰 -> 赵露思、林俊杰。
+        chinese_runs = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{2,}", value)
+        if len(chinese_runs) == 1:
+            value = chinese_runs[0]
+    return normalize_folder_label(value)
 
 
 def identity_keys(song):
@@ -438,7 +447,7 @@ def platform_discover(query):
         if len(parts) == 1:
             return True
         return any(
-            canonical_artist(artist) == canonical_artist(a)
+            artists_match(artist, a)
             and (canonical_title(title) == canonical_title(t) or is_title_variant(title, t))
             for t, a in pair_terms
         )
@@ -451,8 +460,20 @@ def platform_discover(query):
         if len(parts) == 1:
             return True
         return any(canonical_title(title) == canonical_title(t)
-                   or canonical_artist(artist) == canonical_artist(a)
+                   or artists_match(artist, a)
                    for t, a in pair_terms)
+
+    try:
+        # QQ aa.cab 参与正常发现；只保存其候选来源，实际下载仍优先使用该来源。
+        for row in qq_primary_discover(lookup_query):
+            title, artist = row.get("title"), row.get("artist")
+            if accept(title, artist):
+                row = dict(row)
+                row["discovery_source"] = "QQ aa.cab"
+                row["_exact_match"] = exact_accept(title, artist)
+                candidates.append(row)
+    except Exception as exc:
+        log(f"QQ aa.cab 实时目录搜索失败：{exc}")
 
     try:
         rows = request_json(QQ_API, {"msg": lookup_query, "type": "json"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=RETRIES)
