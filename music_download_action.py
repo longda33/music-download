@@ -127,7 +127,7 @@ def validate_candidate_dj_status(item, artist_hint="", require_context=True):
     """检查候选的版本字段；下载源在 --DJ 下没有版本上下文时安全拒绝。"""
     if not isinstance(item, dict):
         return False, "候选不是对象"
-    fields = ("song", "song_title", "song_name", "filename_title", "album_name", "album", "filename", "version", "subtitle")
+    fields = ("title", "song", "song_title", "song_name", "filename_title", "album_name", "album", "filename", "version", "subtitle")
     values = {_field: _metadata_value(item.get(_field)) for _field in fields}
     version_text = " ".join(value for value in values.values() if value)
     artist = _metadata_value(item.get("artist"), item.get("singer"), artist_hint)
@@ -385,6 +385,12 @@ def artists_match(left, right):
     # 仅对单一艺人做模糊判断，避免把合作艺人列表错误合并。
     if "&" in left_key or "&" in right_key:
         return False
+    # 中文艺人名可能带英文艺名或平台前缀，例如 Rosy赵露思；
+    # 两个以上汉字的包含关系可作为单一艺人匹配，避免被长度阈值误过滤。
+    if (left_key in right_key or right_key in left_key):
+        shorter_text = left_key if len(left_key) <= len(right_key) else right_key
+        if len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", shorter_text)) >= 2:
+            return True
     shorter = min(len(left_key), len(right_key))
     if shorter < 4:
         return False
@@ -649,7 +655,7 @@ def discover_songs(mode, query):
                 # 禁止“寂寞沙洲”匹配到“寂寞沙洲冷”等相似标题。
                 title_match = canonical_title(song.get("title", "")) == canonical_title(query)
                 version_match = is_title_variant(song.get("title", ""), query)
-                artist_match = canonical_artist(song.get("artist", "")) == canonical_artist(query)
+                artist_match = artists_match(song.get("artist", ""), query)
                 if not (title_match or version_match or artist_match or space_pair_match(song, query)):
                     continue
         artists = [{"artist": {"name": name.strip()}} for name in re.split(r"[&+/、,，;；|]+", str(song.get("artist", ""))) if name.strip()]
