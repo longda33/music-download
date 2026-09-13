@@ -319,9 +319,12 @@ def dedup_key(value):
 def to_simplified(value):
     value = str(value or "")
     if TRAD_TO_SIMP is not None:
-        return TRAD_TO_SIMP.convert(value)
-    # GitHub Action 会安装 OpenCC；此表仅作为依赖异常时的保底。
-    return value.translate(str.maketrans("趙露思周杰倫林憶蓮張信哲蔡依林樂門國體風學這個後臺", "赵露思周杰伦林忆莲张信哲蔡依林乐门国体风学这个后台"))
+        converted = TRAD_TO_SIMP.convert(value)
+    else:
+        # GitHub Action 会安装 OpenCC；此表仅作为依赖异常时的保底。
+        converted = value.translate(str.maketrans("趙露思周杰倫林憶蓮張信哲蔡依林樂門國體風學這個後臺", "赵露思周杰伦林忆莲张信哲蔡依林乐门国体风学这个后台"))
+    # “蒨/倩”是平台常见异体字写法，不是艺人别名；统一后再做匹配和目录归一化。
+    return converted.translate(str.maketrans({"蒨": "倩"}))
 
 
 def is_chinese_song(title, artist):
@@ -1018,7 +1021,8 @@ def find_source(song, excluded_sources=None):
         "网易云": netease_search,
         "酷我": kuwo_search,
     }
-    source_order = ["QQ tang.api.s01s.cn", "网易云", "酷我", "QQ aa.cab"]
+    # 同一首歌跨音源时固定优先级：QQ（aa.cab、tang）→ 网易云 → 酷我。
+    source_order = ["QQ aa.cab", "QQ tang.api.s01s.cn", "网易云", "酷我"]
     preferred = song.get("discovery_source")
     if preferred in source_order:
         # 筛选后的候选来自哪个接口，就优先从哪个接口解析和下载。
@@ -1027,7 +1031,6 @@ def find_source(song, excluded_sources=None):
     else:
         ordered_sources = source_order
 
-    fallback_items = []
     for source in ordered_sources:
         if source in excluded or source_breaker_open(source):
             continue
@@ -1047,13 +1050,6 @@ def find_source(song, excluded_sources=None):
                     if reason != "OK":
                         log(f"--DJ 版本信息提示：音源={source}，{reason}，歌曲={song.get('title')} - {song.get('artist')}")
                 item_album = _metadata_value(item.get("album_name"), item.get("album"))
-                # 歌手目录搜索没有 discovery_source 时，不能因某个音源先返回
-                # 无专辑候选就停止；继续比较其他音源，优先拿到正式专辑版本。
-                if not preferred and not item_album:
-                    fallback_items.append(item)
-                    source_breaker_success(source)
-                    log(f"音源解析：{source} 返回无专辑候选，继续比较其他音源")
-                    continue
                 expected_album = _metadata_value(song.get("album_name"), song.get("album"))
                 if EXCLUDE_DJ and expected_album and item_album and canonical_title(item_album) != canonical_title(expected_album):
                     log(f"--DJ 版本信息不一致，以下载音源字段为准：音源={source}，目录专辑={expected_album}，音源专辑={item_album}")
@@ -1081,10 +1077,6 @@ def find_source(song, excluded_sources=None):
         except Exception as exc:
             source_breaker_failure(source, exc)
             log(f"{source} 搜索失败，准备尝试下一个音源：{exc}")
-    if fallback_items:
-        selected = min(fallback_items, key=candidate_selection_key)
-        log(f"未找到有效专辑字段，使用无专辑后备候选：{selected.get('source', 'unknown')}")
-        return selected
     return None
 
 
