@@ -322,7 +322,7 @@ def to_simplified(value):
         converted = TRAD_TO_SIMP.convert(value)
     else:
         # GitHub Action 会安装 OpenCC；此表仅作为依赖异常时的保底。
-        converted = value.translate(str.maketrans("趙露思周杰倫林憶蓮張信哲蔡依林樂門國體風學這個後臺", "赵露思周杰伦林忆莲张信哲蔡依林乐门国体风学这个后台"))
+        converted = value.translate(str.maketrans("葉趙露思周杰倫林憶蓮張信哲蔡依林樂門國體風學這個後臺", "叶赵露思周杰伦林忆莲张信哲蔡依林乐门国体风学这个后台"))
     # “蒨/倩”是平台常见异体字写法，不是艺人别名；统一后再做匹配和目录归一化。
     return converted.translate(str.maketrans({"蒨": "倩"}))
 
@@ -909,7 +909,9 @@ def qq_search(title, artist):
         if canonical_title(source_title) != canonical_title(title) or not artists_match(detail_artist, artist):
             log(f"QQ 结果与目标不一致，跳过：{source_title} - {detail_artist}")
             continue
-        for tier, label in (("sq", "SQ"), ("pq", "PQ")):
+        # 默认 SQ 是最低允许音质；--all 解除音质限制，才允许回退到 PQ。
+        tiers = (("sq", "SQ"), ("pq", "PQ")) if ALLOW_NON_FLAC else (("sq", "SQ"),)
+        for tier, label in tiers:
             url = detail.get(f"song_play_url_{tier}")
             filename = detail.get(f"song_filename_{tier}")
             if url and filename and (ALLOW_NON_FLAC or str(filename).lower().endswith(".flac")):
