@@ -515,6 +515,8 @@ def platform_discover(query):
     except Exception as exc:
         log(f"QQ aa.cab 实时目录搜索失败：{exc}")
 
+    discovery_order = {"QQ aa.cab": 0, "QQ tang.api.s01s.cn": 1, "网易云": 2, "酷我": 3}
+    candidates.sort(key=lambda item: discovery_order.get(item.get("discovery_source"), 99))
     exact, pending = [], []
     for item in candidates:
         (exact if item.pop("_exact_match", False) else pending).append(item)
@@ -971,7 +973,8 @@ def find_source(song, excluded_sources=None):
         "网易云": netease_search,
         "酷我": kuwo_search,
     }
-    source_order = ["QQ tang.api.s01s.cn", "网易云", "酷我", "QQ aa.cab"]
+    # 搜索结果及下载轮换的统一来源顺序；每首候选仍优先使用自己的 discovery_source。
+    source_order = ["QQ aa.cab", "QQ tang.api.s01s.cn", "网易云", "酷我"]
     preferred = song.get("discovery_source")
     if preferred in source_order:
         # 筛选后的候选来自哪个接口，就优先从哪个接口解析和下载。
