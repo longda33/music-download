@@ -396,19 +396,27 @@ def artists_match(candidate_artist, query_artist):
     return candidate_tokens == query_tokens
 
 
+def _primary_artist_folder_label(value):
+    """把单一混合中英文艺人标签归一为稳定的主艺人显示名。"""
+    text = unicodedata.normalize("NFKC", to_simplified(str(value or ""))).strip()
+    if not text:
+        return "unknown"
+    # 仅处理单一艺人且无合作分隔符的混合标签；不拆分合唱/合作艺人。
+    if not re.search(r"[&+/、,，;；|]|\b(?:feat\.?|ft\.?|featuring)\b", text, re.I):
+        chinese_runs = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{2,}", text)
+        if len(chinese_runs) == 1:
+            return chinese_runs[0]
+    return text
+
+
 def artist_folder_name(value, related=None):
-    """生成稳定的主艺人目录名；不把平台前缀/英文别名写入目录。"""
+    """生成稳定的主艺人目录名；别名匹配不改变目录标签。"""
     value = str(value or "").strip()
     related = str(related or "").strip()
-    # 用户输入的中文主艺人名优先作为目录标签，避免源返回 Rosy赵露思 时建重复目录。
+    # 用户输入的中文主艺人名优先，但仍归一化平台前/后缀：赵露思i -> 赵露思。
     if related and re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", related):
         value = related
-    else:
-        # 单一中文艺人名从平台前缀中提取：Rosy赵露思、JJ林俊杰 -> 赵露思、林俊杰。
-        chinese_runs = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{2,}", value)
-        if len(chinese_runs) == 1:
-            value = chinese_runs[0]
-    return normalize_folder_label(value)
+    return normalize_folder_label(_primary_artist_folder_label(value))
 
 
 def identity_keys(song):
@@ -424,7 +432,7 @@ def identity_keys(song):
     for platform, value in (song.get("platform_ids") or {}).items():
         if value:
             keys.append(("platform-id", platform, str(value).casefold()))
-    keys.append(("name", title_key, canonical_artist(song.get("artist", ""))))
+    keys.append(("name", title_key, canonical_artist(_primary_artist_folder_label(song.get("artist", "")))))
     return keys
 
 
@@ -464,18 +472,6 @@ def platform_discover(query):
                    for t, a in pair_terms)
 
     try:
-        # QQ aa.cab 参与正常发现；只保存其候选来源，实际下载仍优先使用该来源。
-        for row in qq_primary_discover(lookup_query):
-            title, artist = row.get("title"), row.get("artist")
-            if accept(title, artist):
-                row = dict(row)
-                row["discovery_source"] = "QQ aa.cab"
-                row["_exact_match"] = exact_accept(title, artist)
-                candidates.append(row)
-    except Exception as exc:
-        log(f"QQ aa.cab 实时目录搜索失败：{exc}")
-
-    try:
         rows = request_json(QQ_API, {"msg": lookup_query, "type": "json"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=RETRIES)
         for row in rows if isinstance(rows, list) else []:
             title = row.get("song_title") or row.get("song_name")
@@ -506,11 +502,24 @@ def platform_discover(query):
                 candidates.append({"title": title, "artist": artist, "discovery_source": "网易云", "platform_ids": {"netease_song_id": netease_song_id, "netease_cover_id": netease_cover_id}, "artist_ids": [], "recording_id": None, "isrc": None, "year": None, "_exact_match": exact_accept(title, artist)})
     except Exception as exc:
         log(f"网易云实时目录搜索失败：{exc}")
+
+    try:
+        # aa.cab 正常参与发现，但放在其他实时接口之后，避免跨接口去重时抢占同曲候选。
+        for row in qq_primary_discover(lookup_query):
+            title, artist = row.get("title"), row.get("artist")
+            if accept(title, artist):
+                row = dict(row)
+                row["discovery_source"] = "QQ aa.cab"
+                row["_exact_match"] = exact_accept(title, artist)
+                candidates.append(row)
+    except Exception as exc:
+        log(f"QQ aa.cab 实时目录搜索失败：{exc}")
+
     exact, pending = [], []
     for item in candidates:
         (exact if item.pop("_exact_match", False) else pending).append(item)
     if pending:
-        log(f"本地匹配未确认 {len(pending)} 首，已跳过")
+        log(f"本地歌曲/艺人匹配未确认：{len(pending)} 条目录候选已跳过（不会创建文件夹）")
     return exact
 
 
