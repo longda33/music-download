@@ -56,6 +56,10 @@ EXCLUDE_DJ = False
 SOURCE_BREAKER_THRESHOLD = 2
 SOURCE_BREAKER_COOLDOWN = 120
 SOURCE_BREAKER = {}
+DISCOVERY_SERVICE_DISABLED = set()
+DISCOVERY_SERVICE_NOTICE = set()
+DISCOVERY_RETRIES = 1
+DISCOVERY_TIMEOUT = 20
 
 
 def parse_download_query(value):
@@ -69,11 +73,70 @@ def parse_download_query(value):
     return text, allow_non_flac, exclude_dj
 
 
-def is_dj_variant(title):
-    """用 Unicode 归一化和独立 DJ 词元识别版本，不枚举 DJ 版本名称。"""
-    normalized = unicodedata.normalize("NFKC", str(title or "")).casefold()
-    # DJ 作为独立英文词元即可判定为 DJ 标识；不会误匹配 adjust、djmix 等普通词。
-    return bool(re.search(r"(?<![a-z0-9])dj(?![a-z0-9])", normalized))
+def _metadata_value(*values):
+    """返回第一个有效元数据；空值和占位值不应覆盖真实音源字段。"""
+    for value in values:
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text and text.casefold() not in {"none", "null", "unknown", "0"}:
+            return text
+    return ""
+
+
+def candidate_variant_penalty(item):
+    """识别非普通专辑发行的版本标记；仅用于同源候选优先级。"""
+    if not isinstance(item, dict):
+        return 0
+    text = " ".join(
+        _metadata_value(item.get(field))
+        for field in ("title", "song", "song_title", "song_name", "filename_title", "album_name", "album", "filename", "version", "subtitle")
+    )
+    text = unicodedata.normalize("NFKC", text).casefold()
+    strong = r"(?:\blive\b|\bconcert\b|\bunplugged\b|\bremix\b|\bedit\b|\bradio\b|\bextended\b|\bclub\b|\bdemo\b|\bacoustic\b|\binstrumental\b|\bkaraoke\b|\bversion\b|现场|演唱会|演唱會|音乐会|音樂會|伴奏|重制|重製|修复|修復|改编|改編|网络版|網絡版|特别版|特別版|混音|纯音乐|純音樂|翻唱|串烧|串燒|合唱版|剪辑版|剪輯版|快手版|抖音版|铃声版|鈴聲版|DJ)"
+    return 1 if re.search(strong, text) else 0
+
+
+def candidate_is_live_variant(item):
+    """兼容旧调用：返回候选是否为现场类变体。"""
+    if not isinstance(item, dict):
+        return False
+    text = " ".join(_metadata_value(item.get(field)) for field in ("title", "song", "song_title", "song_name", "filename_title", "album_name", "album", "filename", "version", "subtitle"))
+    text = unicodedata.normalize("NFKC", text).casefold()
+    return bool(re.search(r"(?:\blive\b|\bconcert\b|\bunplugged\b|现场|演唱会|演唱會|音乐会|音樂會)", text))
+
+
+def candidate_selection_key(item):
+    """同源候选选择：只按普通/变体优先级和稳定顺序，不按元数据完整度筛选。"""
+    return (
+        candidate_variant_penalty(item),
+        int((item.get("platform_ids") or {}).get("qq_primary_n") or 10**9),
+    )
+
+
+def is_dj_variant(title_or_version_text, artist_name=""):
+    """仅在版本相关字段中识别独立 DJ 词元，避免误杀 DJ Snake 等艺人。"""
+    text = unicodedata.normalize("NFKC", str(title_or_version_text or "")).casefold()
+    artist = unicodedata.normalize("NFKC", str(artist_name or "")).casefold().strip()
+    if artist:
+        text = text.replace(artist, " ")
+    return bool(re.search(r"(?<![a-z0-9])dj(?![a-z0-9])", text))
+
+
+def validate_candidate_dj_status(item, artist_hint="", require_context=True):
+    """检查候选的版本字段；下载源在 --DJ 下没有版本上下文时安全拒绝。"""
+    if not isinstance(item, dict):
+        return False, "候选不是对象"
+    fields = ("title", "song", "song_title", "song_name", "filename_title", "album_name", "album", "filename", "version", "subtitle")
+    values = {_field: _metadata_value(item.get(_field)) for _field in fields}
+    version_text = " ".join(value for value in values.values() if value)
+    artist = _metadata_value(item.get("artist"), item.get("singer"), artist_hint)
+    if is_dj_variant(version_text, artist_name=artist):
+        return False, "检测到 DJ 标记"
+    has_version_context = any(values[field] for field in ("album_name", "album", "version", "subtitle"))
+    if EXCLUDE_DJ and require_context and not has_version_context:
+        return True, "版本信息不足，无法确认 DJ（不作为 DJ 排除依据）"
+    return True, "OK"
 
 
 def log(message):
@@ -152,21 +215,55 @@ def one_artist(credit):
 
 
 def mb_get(path, params):
+    if "musicbrainz" in DISCOVERY_SERVICE_DISABLED:
+        raise RuntimeError("MusicBrainz 本次任务已熔断")
     time.sleep(1.1)
-    return request_json(f"{MB_API}/{path}", params={**params, "fmt": "json"}, headers=MB_HEADERS)
+    try:
+        return request_json(
+            f"{MB_API}/{path}",
+            params={**params, "fmt": "json"},
+            headers=MB_HEADERS,
+            timeout=DISCOVERY_TIMEOUT,
+            retries=DISCOVERY_RETRIES,
+        )
+    except Exception as exc:
+        DISCOVERY_SERVICE_DISABLED.add("musicbrainz")
+        if "musicbrainz" not in DISCOVERY_SERVICE_NOTICE:
+            DISCOVERY_SERVICE_NOTICE.add("musicbrainz")
+            log(f"MusicBrainz 暂不可用，本次任务跳过后续请求：{exc}")
+        raise
 
 
 def lastfm_get(method, params):
+    if "lastfm" in DISCOVERY_SERVICE_DISABLED:
+        raise RuntimeError("Last.fm 本次任务已熔断")
     api_key = os.getenv("LASTFM_API_KEY")
     if not api_key:
-        fail("缺少 LASTFM_API_KEY")
+        DISCOVERY_SERVICE_DISABLED.add("lastfm")
+        if "lastfm" not in DISCOVERY_SERVICE_NOTICE:
+            DISCOVERY_SERVICE_NOTICE.add("lastfm")
+            log("未配置 LASTFM_API_KEY，本次任务跳过 Last.fm 补充发现")
+        raise RuntimeError("缺少 LASTFM_API_KEY")
     query = {"method": method, "api_key": api_key, "format": "json", **params}
-    r = http_request("GET", LASTFM_API, params=query, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("error"):
-        raise RuntimeError(f"Last.fm API 错误 {data['error']}: {data.get('message', '')}")
-    return data
+    try:
+        r = http_request(
+            "GET",
+            LASTFM_API,
+            params=query,
+            timeout=DISCOVERY_TIMEOUT,
+            _retry_count=DISCOVERY_RETRIES,
+        )
+        r.raise_for_status()
+        data = r.json()
+        if data.get("error"):
+            raise RuntimeError(f"Last.fm API 错误 {data['error']}: {data.get('message', '')}")
+        return data
+    except Exception as exc:
+        DISCOVERY_SERVICE_DISABLED.add("lastfm")
+        if "lastfm" not in DISCOVERY_SERVICE_NOTICE:
+            DISCOVERY_SERVICE_NOTICE.add("lastfm")
+            log(f"Last.fm 暂不可用，本次任务跳过后续请求：{exc}")
+        raise
 
 
 def lastfm_recording(row):
@@ -278,28 +375,48 @@ def normalize_folder_label(value):
     return text or "unknown"
 
 
-def artists_match(left, right):
-    """使用归一化、包含关系和相似度识别艺人，不依赖规则表或别名穷举。"""
-    left_key, right_key = canonical_artist(left), canonical_artist(right)
-    if not left_key or not right_key:
+def extract_artist_tokens(value):
+    """拆分中英文艺人标记，支持 Rosy赵露思 和合唱信息，不使用别名表。"""
+    raw = unicodedata.normalize("NFKC", to_simplified(str(value or ""))).casefold()
+    parts = re.split(r"[&+/、,，;；|]+|\bfeat\.?|\bft\.?|\bfeaturing\b", raw)
+    tokens = set()
+    for part in parts:
+        tokens.update(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+|[a-z0-9]+", part))
+    return {token for token in tokens if len(token) > 1}
+
+
+def artists_match(candidate_artist, query_artist):
+    """匹配艺人：单艺人查询允许候选为合唱；多艺人查询必须精确覆盖。"""
+    candidate_tokens = extract_artist_tokens(candidate_artist)
+    query_tokens = extract_artist_tokens(query_artist)
+    if not candidate_tokens or not query_tokens:
         return False
-    if left_key == right_key:
-        return True
-    # 仅对单一艺人做模糊判断，避免把合作艺人列表错误合并。
-    if "&" in left_key or "&" in right_key:
-        return False
-    shorter = min(len(left_key), len(right_key))
-    if shorter < 4:
-        return False
-    if left_key in right_key or right_key in left_key:
-        return True
-    return difflib.SequenceMatcher(None, left_key, right_key).ratio() >= 0.92
+    if len(query_tokens) == 1:
+        return next(iter(query_tokens)) in candidate_tokens
+    return candidate_tokens == query_tokens
+
+
+def _primary_artist_folder_label(value):
+    """把单一混合中英文艺人标签归一为稳定的主艺人显示名。"""
+    text = unicodedata.normalize("NFKC", to_simplified(str(value or ""))).strip()
+    if not text:
+        return "unknown"
+    # 仅处理单一艺人且无合作分隔符的混合标签；不拆分合唱/合作艺人。
+    if not re.search(r"[&+/、,，;；|]|\b(?:feat\.?|ft\.?|featuring)\b", text, re.I):
+        chinese_runs = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{2,}", text)
+        if len(chinese_runs) == 1:
+            return chinese_runs[0]
+    return text
 
 
 def artist_folder_name(value, related=None):
-    """生成稳定的艺人文件夹名称，不依赖别名文件。"""
-    key = canonical_artist(value)
-    return normalize_folder_label(ARTIST_FOLDER_NAMES.get(key) or value)
+    """生成稳定的主艺人目录名；别名匹配不改变目录标签。"""
+    value = str(value or "").strip()
+    related = str(related or "").strip()
+    # 用户输入的中文主艺人名优先，但仍归一化平台前/后缀：赵露思i -> 赵露思。
+    if related and re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", related):
+        value = related
+    return normalize_folder_label(_primary_artist_folder_label(value))
 
 
 def identity_keys(song):
@@ -315,7 +432,7 @@ def identity_keys(song):
     for platform, value in (song.get("platform_ids") or {}).items():
         if value:
             keys.append(("platform-id", platform, str(value).casefold()))
-    keys.append(("name", title_key, canonical_artist(song.get("artist", ""))))
+    keys.append(("name", title_key, canonical_artist(_primary_artist_folder_label(song.get("artist", "")))))
     return keys
 
 
@@ -338,7 +455,7 @@ def platform_discover(query):
         if len(parts) == 1:
             return True
         return any(
-            canonical_artist(artist) == canonical_artist(a)
+            artists_match(artist, a)
             and (canonical_title(title) == canonical_title(t) or is_title_variant(title, t))
             for t, a in pair_terms
         )
@@ -351,18 +468,8 @@ def platform_discover(query):
         if len(parts) == 1:
             return True
         return any(canonical_title(title) == canonical_title(t)
-                   or canonical_artist(artist) == canonical_artist(a)
+                   or artists_match(artist, a)
                    for t, a in pair_terms)
-
-    try:
-        for row in qq_primary_discover(lookup_query):
-            title, artist = row.get("title"), row.get("artist")
-            if accept(title, artist):
-                row["_exact_match"] = exact_accept(title, artist)
-                row["discovery_source"] = "QQ aa.cab"
-                candidates.append(row)
-    except Exception as exc:
-        log(f"新 QQ 实时目录搜索失败：{exc}")
 
     try:
         rows = request_json(QQ_API, {"msg": lookup_query, "type": "json"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=RETRIES)
@@ -395,11 +502,24 @@ def platform_discover(query):
                 candidates.append({"title": title, "artist": artist, "discovery_source": "网易云", "platform_ids": {"netease_song_id": netease_song_id, "netease_cover_id": netease_cover_id}, "artist_ids": [], "recording_id": None, "isrc": None, "year": None, "_exact_match": exact_accept(title, artist)})
     except Exception as exc:
         log(f"网易云实时目录搜索失败：{exc}")
+
+    try:
+        # aa.cab 正常参与发现，但放在其他实时接口之后，避免跨接口去重时抢占同曲候选。
+        for row in qq_primary_discover(lookup_query):
+            title, artist = row.get("title"), row.get("artist")
+            if accept(title, artist):
+                row = dict(row)
+                row["discovery_source"] = "QQ aa.cab"
+                row["_exact_match"] = exact_accept(title, artist)
+                candidates.append(row)
+    except Exception as exc:
+        log(f"QQ aa.cab 实时目录搜索失败：{exc}")
+
     exact, pending = [], []
     for item in candidates:
         (exact if item.pop("_exact_match", False) else pending).append(item)
     if pending:
-        log(f"本地匹配未确认 {len(pending)} 首，已跳过")
+        log(f"本地歌曲/艺人匹配未确认：{len(pending)} 条目录候选已跳过（不会创建文件夹）")
     return exact
 
 
@@ -547,8 +667,11 @@ def discover_songs(mode, query):
     seen = set()
     result = []
     for song in songs:
-        if EXCLUDE_DJ and is_dj_variant(song.get("title", "")):
-            continue
+        if EXCLUDE_DJ:
+            safe, reason = validate_candidate_dj_status(song, artist_hint=song.get("artist", ""), require_context=False)
+            if not safe:
+                log(f"--DJ 跳过目录候选：{reason}：{song.get('title', '')} - {song.get('artist', '')}")
+                continue
         if mode == "search":
             parts = query_terms(query)
             if len(parts) >= 2:
@@ -559,7 +682,7 @@ def discover_songs(mode, query):
                 # 禁止“寂寞沙洲”匹配到“寂寞沙洲冷”等相似标题。
                 title_match = canonical_title(song.get("title", "")) == canonical_title(query)
                 version_match = is_title_variant(song.get("title", ""), query)
-                artist_match = canonical_artist(song.get("artist", "")) == canonical_artist(query)
+                artist_match = artists_match(song.get("artist", ""), query)
                 if not (title_match or version_match or artist_match or space_pair_match(song, query)):
                     continue
         artists = [{"artist": {"name": name.strip()}} for name in re.split(r"[&+/、,，;；|]+", str(song.get("artist", ""))) if name.strip()]
@@ -589,13 +712,36 @@ def qq_primary_result(query, index=1):
 
 
 def qq_primary_search(title, artist, index=1):
-    """优先使用新 QQ 接口，精确获取指定结果的 SQ 无损地址。"""
+    """优先使用新 QQ 接口，并在最终解析前重新选择同源最佳候选。"""
     query = f"{title} {artist}"
-    row = qq_primary_result(query, index)
+    # 不能盲信发现阶段传入的 num：上游可能来自旧缓存或旧版本目录结果。
+    # 最终下载前重新读取同源候选，确保同歌名/歌手优先选择信息最完整的一条。
+    selected_index = index
+    try:
+        refreshed = qq_primary_discover(query)
+        matching = [
+            item for item in refreshed
+            if canonical_title(item.get("title", "")) == canonical_title(title)
+            and artists_match(item.get("artist", ""), artist)
+        ]
+        if matching:
+            selected_index = int((matching[0].get("platform_ids") or {}).get("qq_primary_n") or index)
+            if selected_index != index:
+                log(f"QQ aa.cab 最终解析重新选择同源最佳候选：num={index} -> num={selected_index}")
+    except Exception as exc:
+        log(f"QQ aa.cab 最终候选刷新失败，暂使用原候选 num={index}：{exc}")
+    row = qq_primary_result(query, selected_index)
     if not row:
         return None
     row_title = str(row.get("song") or row.get("song_name") or "").strip()
     row_artist = str(row.get("singer") or row.get("artist") or "").strip()
+    album_name = str(row.get("album_name") or row.get("album") or "").strip()
+    version_text = " ".join(str(row.get(key) or "") for key in ("song", "song_name", "album_name", "album", "filename", "version", "subtitle"))
+    if EXCLUDE_DJ:
+        safe, reason = validate_candidate_dj_status(row, artist_hint=artist)
+        if not safe:
+            log(f"--DJ 拦截 aa.cab 解析结果：{reason}：{row_title} - {row_artist}，num={index}")
+            return None
     music = str(row.get("music") or row.get("url") or "").strip()
     if (canonical_title(row_title) != canonical_title(title)
             or not artists_match(row_artist, artist)
@@ -608,10 +754,14 @@ def qq_primary_search(title, artist, index=1):
         "url": music,
         "filename": f"{row_title} {row_artist}.{extension}",
         "filename_title": row_title,
+        "artist": row_artist,
+        "album_name": album_name,
+        "album_mid": row.get("album_mid"),
         "size": int(row.get("size") or 0),
         "source": "QQ aa.cab",
         "quality": "标准音质" if ALLOW_NON_FLAC else "SQ无损",
         "platform_ids": {
+            "qq_primary_n": selected_index,
             "qq_primary_mid": row.get("mid"),
             "qq_primary_media_mid": row.get("media_mid"),
             "qq_primary_album_mid": row.get("album_mid"),
@@ -639,13 +789,42 @@ def qq_primary_discover(query):
             continue
         title = str(row.get("song") or row.get("song_name") or "").strip()
         artist = str(row.get("singer") or row.get("artist") or "").strip()
+        album_name = str(row.get("album_name") or row.get("album") or "").strip()
+        if EXCLUDE_DJ:
+            candidate = {**row, "title": title, "artist": artist, "album_name": album_name}
+            safe, reason = validate_candidate_dj_status(candidate, artist_hint=artist)
+            if not safe:
+                log(f"--DJ 拦截 aa.cab 候选：{reason}：{title} - {artist}，num={row.get('num', position)}")
+                continue
         mid = str(row.get("mid") or row.get("media_mid") or "")
         key = (canonical_title(title), canonical_artist(artist), mid)
         if not title or not artist or key in seen:
             continue
         seen.add(key)
         index = int(row.get("num") or position)
-        result.append({"title": title, "artist": artist, "platform_ids": {"qq_primary_n": index, "qq_primary_mid": row.get("mid"), "qq_primary_media_mid": row.get("media_mid"), "qq_primary_album_mid": row.get("album_mid")}, "artist_ids": [], "recording_id": None, "isrc": None, "year": None})
+        result.append({
+            "title": title,
+            "artist": artist,
+            "album_name": album_name,
+            "album_mid": row.get("album_mid"),
+            "filename": row.get("filename"),
+            "version": row.get("version"),
+            "subtitle": row.get("subtitle"),
+            "platform_ids": {"qq_primary_n": index, "qq_primary_mid": row.get("mid"), "qq_primary_media_mid": row.get("media_mid"), "qq_primary_album_mid": row.get("album_mid")},
+            "artist_ids": [],
+            "recording_id": None,
+            "isrc": row.get("isrc"),
+            "year": row.get("year"),
+        })
+    # 同一音源中歌名和歌手完全相同的重复结果，只保留信息最完整的一条。
+    best_by_identity = {}
+    for item in result:
+        identity = (canonical_title(item.get("title", "")), canonical_artist(item.get("artist", "")))
+        previous = best_by_identity.get(identity)
+        if previous is None or candidate_selection_key(item) < candidate_selection_key(previous):
+            best_by_identity[identity] = item
+    result = list(best_by_identity.values())
+    result.sort(key=candidate_selection_key)
     return result
 
 
@@ -654,14 +833,21 @@ def qq_search(title, artist):
     rows = request_json(QQ_API, {"msg": f"{title} {artist}", "type": "json"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=RETRIES)
     if not isinstance(rows, list):
         return None
-    for row in rows[:3]:
+    candidate_rows = [
+        row for row in rows
+        if isinstance(row, dict)
+        and canonical_title(row.get("song_title") or row.get("song_name") or "") == canonical_title(title)
+        and artists_match(row.get("singer_name") or row.get("singer") or "", artist)
+    ]
+    candidate_rows.sort(key=candidate_selection_key)
+    for row in candidate_rows:
         if not isinstance(row, dict) or not row.get("song_mid"):
             continue
         row_title = str(row.get("song_title") or row.get("song_name") or "").strip()
         row_artist = str(row.get("singer_name") or row.get("singer") or "").strip()
         if canonical_title(row_title) != canonical_title(title):
             continue
-        if canonical_artist(row_artist) != canonical_artist(artist):
+        if not artists_match(row_artist, artist):
             continue
         detail = request_json(QQ_API, {"msg": f"{title} {artist}", "type": "json", "mid": row["song_mid"]}, SOURCE_HEADERS, timeout=DETAIL_TIMEOUT, retries=RETRIES)
         detail_title = str(detail.get("song_title") or detail.get("song_name") or "").strip()
@@ -670,7 +856,7 @@ def qq_search(title, artist):
             log(f"QQ 详情缺少歌曲名或歌手名，跳过：{row_title} - {row_artist}")
             continue
         source_title = detail_title
-        if canonical_title(source_title) != canonical_title(title) or canonical_artist(detail_artist) != canonical_artist(artist):
+        if canonical_title(source_title) != canonical_title(title) or not artists_match(detail_artist, artist):
             log(f"QQ 结果与目标不一致，跳过：{source_title} - {detail_artist}")
             continue
         for tier, label in (("sq", "SQ"), ("pq", "PQ")):
@@ -678,7 +864,7 @@ def qq_search(title, artist):
             filename = detail.get(f"song_filename_{tier}")
             if url and filename and (ALLOW_NON_FLAC or str(filename).lower().endswith(".flac")):
                 extension = Path(urlparse(str(url)).path).suffix.lower().lstrip(".") or Path(str(filename)).suffix.lower().lstrip(".") or "mp3"
-                return {"url": url, "filename": filename, "filename_title": source_title, "size": int(detail.get(f"song_size_{tier}_str") or 0), "source": "QQ tang.api.s01s.cn", "quality": label, "extension": extension, "platform_ids": {"qq_song_id": detail.get("song_id"), "qq_song_mid": detail.get("song_mid") or row.get("song_mid"), "qq_singer_id": detail.get("singer_id"), "qq_singer_mid": detail.get("singer_mid")}}
+                return {"url": url, "filename": filename, "filename_title": source_title, "artist": detail_artist, "album_name": str(detail.get("album_name") or detail.get("album") or row.get("album_name") or "").strip(), "size": int(detail.get(f"song_size_{tier}_str") or 0), "source": "QQ tang.api.s01s.cn", "quality": label, "extension": extension, "platform_ids": {"qq_song_id": detail.get("song_id"), "qq_song_mid": detail.get("song_mid") or row.get("song_mid"), "qq_singer_id": detail.get("singer_id"), "qq_singer_mid": detail.get("singer_mid")}}
     return None
 
 
@@ -714,7 +900,9 @@ def kuwo_search(title, artist):
         factor = {"b": 1, "kib": 1024, "kb": 1024, "mib": 1024**2, "mb": 1024**2, "gib": 1024**3, "gb": 1024**3}[unit]
         return int(number * factor)
 
-    for index, row in enumerate(rows, 1):
+    indexed_rows = [(index, row) for index, row in enumerate(rows, 1) if isinstance(row, dict)]
+    indexed_rows.sort(key=lambda pair: candidate_selection_key({**pair[1], "title": pair[1].get("song"), "artist": pair[1].get("singer"), "platform_ids": {"source_index": pair[0]}}))
+    for index, row in indexed_rows:
         if not isinstance(row, dict):
             continue
         if canonical_title(row.get("song", "")) != canonical_title(title):
@@ -742,15 +930,17 @@ def kuwo_search(title, artist):
         fmt = str(item.get("format", "")).lower() if isinstance(item, dict) else ""
         if url and (ALLOW_NON_FLAC or (fmt == "flac" and str(url).lower().split("?")[0].endswith(".flac"))):
             extension = Path(urlparse(str(url)).path).suffix.lower().lstrip(".") or fmt or "mp3"
-            return {"url": url, "filename": f"{title}.{extension}", "filename_title": detail_title, "size": size_bytes(item.get("size", "")), "source": "酷我", "quality": f"{fmt.upper() or 'AUDIO'} {item.get('bitrate', '')}kbps", "extension": extension, "platform_ids": {"kuwo_id": item.get("id"), "kuwo_rid": item.get("rid") or row.get("rid")}}
+            return {"url": url, "filename": f"{title}.{extension}", "filename_title": detail_title, "artist": detail_artist, "album_name": str(item.get("album_name") or item.get("album") or row.get("album_name") or row.get("album") or "").strip(), "size": size_bytes(item.get("size", "")), "source": "酷我", "quality": f"{fmt.upper() or 'AUDIO'} {item.get('bitrate', '')}kbps", "extension": extension, "platform_ids": {"kuwo_id": item.get("id"), "kuwo_rid": item.get("rid") or row.get("rid")}}
     return None
 
 
 def netease_search(title, artist):
     data = request_json(NETEASE_API, {"type": "search", "id": f"{title} {artist}", "limit": 10, "page": 1, "server": "netease"}, SOURCE_HEADERS, timeout=SOURCE_TIMEOUT, retries=RETRIES)
-    for row in (data if isinstance(data, list) else []):
+    indexed_rows = [(index, row) for index, row in enumerate(data if isinstance(data, list) else [], 1) if isinstance(row, dict)]
+    indexed_rows.sort(key=lambda pair: candidate_selection_key({**pair[1], "title": pair[1].get("name"), "artist": pair[1].get("artist"), "platform_ids": {"source_index": pair[0]}}))
+    for _, row in indexed_rows:
         row_title, row_artist = row.get("name", ""), row.get("artist", "")
-        if canonical_title(row_title) != canonical_title(title) or canonical_artist(row_artist) != canonical_artist(artist):
+        if canonical_title(row_title) != canonical_title(title) or not artists_match(row_artist, artist):
             continue
         search_url = row.get("url", "")
         song_id = parse_qs(urlparse(search_url).query).get("id", [""])[0]
@@ -766,7 +956,7 @@ def netease_search(title, artist):
             probe.close()
             if ALLOW_NON_FLAC or is_flac:
                 extension = Path(urlparse(probe.url).path).suffix.lower().lstrip(".") or ("flac" if is_flac else "mp3")
-                return {"url": download_url, "filename": f"{title}.{extension}", "filename_title": str(row_title).strip(), "size": size, "source": "网易云", "quality": "FLAC" if is_flac else "标准音质", "extension": extension, "album": str(row.get("album") or "").strip(), "cover_url": str(row.get("pic") or "").strip(), "lyric_url": str(row.get("lrc") or "").strip(), "platform_ids": {"netease_song_id": song_id, "netease_cover_id": parse_qs(urlparse(str(row.get("pic") or "")).query).get("id", [""])[0]}}
+                return {"url": download_url, "filename": f"{title}.{extension}", "filename_title": str(row_title).strip(), "artist": str(row_artist).strip(), "album_name": str(row.get("album") or "").strip(), "size": size, "source": "网易云", "quality": "FLAC" if is_flac else "标准音质", "extension": extension, "album": str(row.get("album") or "").strip(), "cover_url": str(row.get("pic") or "").strip(), "lyric_url": str(row.get("lrc") or "").strip(), "platform_ids": {"netease_song_id": song_id, "netease_cover_id": parse_qs(urlparse(str(row.get("pic") or "")).query).get("id", [""])[0]}}
         except Exception:
             pass
     return None
@@ -781,9 +971,11 @@ def find_source(song, excluded_sources=None):
         "网易云": netease_search,
         "酷我": kuwo_search,
     }
-    source_order = ["QQ aa.cab", "QQ tang.api.s01s.cn", "网易云", "酷我"]
+    source_order = ["QQ tang.api.s01s.cn", "网易云", "酷我", "QQ aa.cab"]
     preferred = song.get("discovery_source")
     if preferred in source_order:
+        # 筛选后的候选来自哪个接口，就优先从哪个接口解析和下载。
+        # 只有该接口失败，才按统一后备顺序切换其他接口。
         ordered_sources = [preferred] + [source for source in source_order if source != preferred]
     else:
         ordered_sources = source_order
@@ -799,13 +991,36 @@ def find_source(song, excluded_sources=None):
             else:
                 item = func(song["title"], song["artist"])
             if item:
-                resolved_title = item.get("filename_title") or item.get("title") or item.get("filename", "")
-                if EXCLUDE_DJ and is_dj_variant(resolved_title):
-                    log(f"{source} 解析到 DJ 版本，按 --DJ 排除：{resolved_title}")
-                    continue
+                if EXCLUDE_DJ:
+                    safe, reason = validate_candidate_dj_status(item, artist_hint=song.get("artist", ""))
+                    if not safe:
+                        log(f"--DJ 跳过音源候选：音源={source}，原因={reason}，歌曲={song.get('title')} - {song.get('artist')}")
+                        continue
+                    if reason != "OK":
+                        log(f"--DJ 版本信息提示：音源={source}，{reason}，歌曲={song.get('title')} - {song.get('artist')}")
+                item_album = _metadata_value(item.get("album_name"), item.get("album"))
+                expected_album = _metadata_value(song.get("album_name"), song.get("album"))
+                if EXCLUDE_DJ and expected_album and item_album and canonical_title(item_album) != canonical_title(expected_album):
+                    log(f"--DJ 版本信息不一致，以下载音源字段为准：音源={source}，目录专辑={expected_album}，音源专辑={item_album}")
                 source_breaker_success(source)
-                merged = {**item, **song}
-                merged["platform_ids"] = {**item.get("platform_ids", {}), **song.get("platform_ids", {})}
+                # 源音源字段优先；发现目录只补充源音源没有返回的字段。
+                merged = {**song, **item}
+                # 仅补充下载音源没有返回的非版本字段；专辑/版本不能借用目录候选。
+                for field in ("title", "artist", "isrc", "year"):
+                    if not _metadata_value(item.get(field)) and _metadata_value(song.get(field)):
+                        merged[field] = song[field]
+                merged["album_name"] = item_album
+                if expected_album and not item_album:
+                    merged["discovery_album_name"] = expected_album
+                merged["platform_ids"] = {**song.get("platform_ids", {}), **item.get("platform_ids", {})}
+                if source == "QQ aa.cab":
+                    if EXCLUDE_DJ:
+                        if reason == "OK":
+                            log(f"--DJ 候选已通过明确版本信息检查：num={(merged.get('platform_ids') or {}).get('qq_primary_n')}，mid={(merged.get('platform_ids') or {}).get('qq_primary_mid')}，专辑={merged.get('album_name') or '未知'}")
+                        else:
+                            log(f"--DJ 候选未发现明确 DJ 标记，版本信息不足：num={(merged.get('platform_ids') or {}).get('qq_primary_n')}，mid={(merged.get('platform_ids') or {}).get('qq_primary_mid')}，专辑={merged.get('album_name') or '未知'}")
+                    else:
+                        log(f"QQ aa.cab 候选已解析：num={(merged.get('platform_ids') or {}).get('qq_primary_n')}，mid={(merged.get('platform_ids') or {}).get('qq_primary_mid')}，专辑={merged.get('album_name') or '未知'}")
                 log(f"音源解析：使用 {source}，已成功解析")
                 return merged
         except Exception as exc:
@@ -935,104 +1150,86 @@ def netease_metadata(title, artist, seed=None):
 
 
 def embed_metadata(local_path, song):
-    """将歌曲信息、歌词和封面写入 FLAC，并验证写入结果。"""
+    """封装 FLAC；下载音源字段优先，第三方仅补充缺失字段。"""
     if FLAC is None or Picture is None:
         raise RuntimeError("未安装 mutagen，无法封装歌曲元数据")
-    title, artist = song.get("title", ""), song.get("artist", "")
+    source_title = _metadata_value(song.get("filename_title"), song.get("title"))
+    source_artist = _metadata_value(song.get("artist"), song.get("singer"))
+    source_album = _metadata_value(song.get("album_name"), song.get("album"))
+    source_lyrics = _metadata_value(song.get("lyrics"), song.get("lyric"))
+    source_cover_url = _metadata_value(song.get("cover_url"))
+    source_lyric_url = _metadata_value(song.get("lyric_url"))
+    if not source_title or not source_artist:
+        raise RuntimeError("缺失下载音源返回的核心 Title 或 Artist 元数据，拒绝封装")
+
     try:
         audio = FLAC(str(local_path))
-        # 下载源返回的原始歌曲名优先，保留 (Live)、现场版等版本标识。
-        title = str(song.get("filename_title") or song.get("title", "")).strip()
-        artist = str(song.get("artist", "")).strip()
-        audio["title"] = [title]
-        audio["artist"] = [artist]
-        if song.get("album"):
-            audio["album"] = [song["album"]]
+        audio["title"] = [source_title]
+        audio["artist"] = [source_artist]
+        if source_album:
+            audio["album"] = [source_album]
         audio["comment"] = [f"Source: {song.get('source', '')}; Quality: {song.get('quality', '')}"]
 
-        # 网易云优先提供封面、歌词和专辑信息。
-        netease = netease_metadata(title, artist, seed=song)
-        if netease.get("album") and not song.get("album"):
-            audio["album"] = [netease["album"]]
-        if netease.get("lyrics"):
-            audio["lyrics"] = [netease["lyrics"]]
-        if netease.get("cover_url"):
-            cover = http_request("GET", netease["cover_url"], headers=SOURCE_HEADERS, timeout=30)
-            cover.raise_for_status()
-            picture = Picture()
-            picture.type = 3
-            picture.mime = cover.headers.get("Content-Type", "image/jpeg").split(";")[0]
-            picture.desc = "Cover"
-            picture.data = cover.content
-            audio.clear_pictures()
-            audio.add_picture(picture)
-
-        # 网易云无结果时，Last.fm 提供封面和专辑信息。
-        info = {}
-        if os.getenv("LASTFM_API_KEY"):
+        # 只有音源字段缺失时才请求第三方；第三方不能覆盖源标题、歌手或版本。
+        fallback = {}
+        if not source_album or not source_lyrics or not source_cover_url:
             try:
-                info = lastfm_get("track.getInfo", {"artist": artist, "track": title, "autocorrect": 1}).get("track", {})
-                album = info.get("album") or {}
-                album_name = album.get("title")
-                if album_name and not song.get("album") and not netease.get("album"):
-                    audio["album"] = [album_name]
-                images = album.get("image") or []
-                # Last.fm 可能只让某一个尺寸的 CDN 地址失效；
-                # 按大图到小图依次尝试，成功一个即可写入封面。
-                cover_urls = []
-                for image in reversed(images):
-                    image_url = str(image.get("#text") or "").strip() if isinstance(image, dict) else ""
-                    if image_url and image_url not in cover_urls:
-                        cover_urls.append(image_url)
-                if cover_urls and not netease.get("cover_url"):
-                    cover = None
-                    for cover_url in cover_urls:
-                        candidate = http_request("GET", cover_url, headers=SOURCE_HEADERS, timeout=30)
-                        if candidate.status_code == 404:
-                            continue
-                        candidate.raise_for_status()
-                        if candidate.content:
-                            cover = candidate
-                            break
-                    if cover is None:
-                        log("Last.fm 封面地址均不可用，跳过封面；专辑信息继续使用")
-                    else:
-                        picture = Picture()
-                        picture.type = 3
-                        picture.mime = cover.headers.get("Content-Type", "image/jpeg").split(";")[0]
-                        picture.desc = "Cover"
-                        picture.data = cover.content
-                        audio.clear_pictures()
-                        audio.add_picture(picture)
+                fallback = netease_metadata(source_title, source_artist, seed=song) or {}
             except Exception as exc:
-                if "Last.fm API 错误 6" in str(exc):
-                    log(f"Last.fm 未找到歌曲信息：{title} - {artist}")
-                else:
-                    log(f"Last.fm 封面/专辑信息获取失败：{exc}")
+                log(f"网易云补充元数据失败，继续保留音源信息：{exc}")
+        fallback_album = _metadata_value(fallback.get("album"))
+        if not source_album and fallback_album:
+            audio["album"] = [fallback_album]
+            log(f"使用第三方补充专辑名：{fallback_album}")
 
-        # LRCLIB 作为网易云无歌词时的补充。
-        if not netease.get("lyrics"):
+        # 歌词优先级：音源直接返回 > 音源歌词地址 > 网易云 > LRCLIB。
+        final_lyrics = source_lyrics
+        if not final_lyrics and source_lyric_url:
             try:
-                lyric = http_request("GET", "https://lrclib.net/api/get", params={"track_name": title, "artist_name": artist}, timeout=30)
-                if lyric.status_code == 200:
-                    lyric_data = lyric.json()
-                    lyrics = lyric_data.get("syncedLyrics") or lyric_data.get("plainLyrics")
-                    lyrics = simplify_chinese_lyrics(lyrics, title, artist)
-                    if lyrics:
-                        audio["lyrics"] = [lyrics]
+                response = http_request("GET", source_lyric_url, headers=SOURCE_HEADERS, timeout=DETAIL_TIMEOUT)
+                if response.ok:
+                    final_lyrics = simplify_chinese_lyrics(response.text, source_title, source_artist)
             except Exception as exc:
-                log(f"LRCLIB 歌词获取失败：{exc}")
+                log(f"读取音源歌词失败，继续使用第三方补充：{exc}")
+        if not final_lyrics:
+            final_lyrics = _metadata_value(fallback.get("lyrics"))
+        if not final_lyrics:
+            try:
+                response = http_request("GET", "https://lrclib.net/api/get", params={"track_name": source_title, "artist_name": source_artist}, timeout=30)
+                if response.status_code == 200:
+                    data = response.json()
+                    final_lyrics = simplify_chinese_lyrics(data.get("syncedLyrics") or data.get("plainLyrics"), source_title, source_artist)
+            except Exception as exc:
+                log(f"LRCLIB 歌词补充失败：{exc}")
+        if final_lyrics:
+            audio["lyrics"] = [final_lyrics]
+
+        # 封面优先使用音源 URL；没有时才使用网易云补充封面。
+        final_cover_url = source_cover_url or _metadata_value(fallback.get("cover_url"))
+        if final_cover_url:
+            try:
+                cover = http_request("GET", final_cover_url, headers=SOURCE_HEADERS, timeout=30)
+                if cover.ok and cover.content:
+                    picture = Picture()
+                    picture.type = 3
+                    picture.mime = cover.headers.get("Content-Type", "image/jpeg").split(";")[0]
+                    picture.desc = "Cover"
+                    picture.data = cover.content
+                    audio.clear_pictures()
+                    audio.add_picture(picture)
+            except Exception as exc:
+                log(f"封面下载/写入失败，不影响音频保存：{exc}")
         audio.save()
 
-        # 重新打开验证，禁止未封装文件继续上传。
+        # 只有核心 Title/Artist 写入失败才中止；歌词和封面缺失不删除完整音频。
         verified = FLAC(str(local_path))
-        if verified.get("title", [""])[0] != title or verified.get("artist", [""])[0] != artist:
-            raise RuntimeError("FLAC 标题或歌手验证失败")
-        if netease.get("lyrics") and not verified.get("lyrics"):
-            raise RuntimeError("网易云歌词未写入 FLAC")
-        if netease.get("cover_url") and not verified.pictures:
-            raise RuntimeError("网易云封面未写入 FLAC")
-        log(f"元数据封装并验证完成：{title} - {artist}（歌词={'有' if verified.get('lyrics') else '无'}，封面={'有' if verified.pictures else '无'}）")
+        actual_title = verified.get("title", [""])[0]
+        actual_artist = verified.get("artist", [""])[0]
+        if actual_title != source_title or actual_artist != source_artist:
+            raise RuntimeError(f"FLAC 核心元数据校验失败：期望 {source_title} - {source_artist}")
+        log(f"元数据封装并验证完成：{source_title} - {source_artist}（歌词={'有' if verified.get('lyrics') else '无'}，封面={'有' if verified.pictures else '无'}）")
+    except RuntimeError:
+        raise
     except Exception as exc:
         raise RuntimeError(f"FLAC 元数据封装失败：{exc}") from exc
 
@@ -1089,16 +1286,42 @@ def openlist_api(auth, endpoint):
 
 
 def ensure_openlist_folder(auth, subfolder=None):
+    """创建并验证 OpenList 目录；不能只依赖 mkdir 的返回码。"""
     path = openlist_file_path(subfolder=subfolder)
-    r = http_request("POST", openlist_api(auth, "mkdir"), headers=openlist_headers(auth, {"Content-Type": "application/json"}), json={"path": path}, timeout=60)
-    if r.status_code >= 400:
+    last_error = None
+    for attempt in range(1, RETRIES + 1):
         try:
-            data = r.json()
-        except ValueError:
-            data = {}
-        # OpenList 已存在目录时返回错误，后续 list/put 仍可正常进行。
-        if data.get("code") not in (200, 400):
-            r.raise_for_status()
+            r = http_request(
+                "POST",
+                openlist_api(auth, "mkdir"),
+                headers=openlist_headers(auth, {"Content-Type": "application/json"}),
+                json={"path": path},
+                timeout=60,
+            )
+            try:
+                data = r.json()
+            except ValueError:
+                data = {}
+            api_code = data.get("code") if isinstance(data, dict) else None
+            if r.status_code >= 400 and api_code not in (200, 400):
+                r.raise_for_status()
+            # OpenList 已存在目录时可能返回 400；必须通过 list 验证，而不是直接放行。
+            verify = http_request(
+                "POST",
+                openlist_api(auth, "list"),
+                headers=openlist_headers(auth, {"Content-Type": "application/json"}),
+                json={"path": path, "password": "", "page": 1, "per_page": 1, "refresh": True},
+                timeout=60,
+            )
+            verify_data = verify.json()
+            if verify.status_code < 400 and isinstance(verify_data, dict) and verify_data.get("code") == 200:
+                return
+            last_error = RuntimeError(f"OpenList 目录验证失败：{verify_data}")
+        except Exception as exc:
+            last_error = exc
+        if attempt < RETRIES:
+            time.sleep(RETRY_INTERVAL * attempt)
+    raise RuntimeError(f"OpenList 目录不存在或创建失败：{path}；原因={last_error}") from last_error
 
 
 def openlist_listing(auth, subfolder=None):
@@ -1146,6 +1369,8 @@ def choose_filename(auth, base_filename, size, subfolder=None, files=None):
 
 def upload(auth, local_path, filename, subfolder=None):
     filename = safe_name(filename)
+    # 上传前再次确认目标目录，避免 mkdir 异步未生效或目录被删除。
+    ensure_openlist_folder(auth, subfolder=subfolder)
     path = openlist_file_path(filename, subfolder=subfolder)
     expected = local_path.stat().st_size
     log(f"OpenList API 上传：{filename}")
@@ -1215,6 +1440,9 @@ def callback(payload):
 
 def main():
     global ACTIVE_PAYLOAD
+    DISCOVERY_SERVICE_DISABLED.clear()
+    DISCOVERY_SERVICE_NOTICE.clear()
+    SOURCE_BREAKER.clear()
     raw = os.getenv("EVENT_PAYLOAD", "")
     if not raw:
         fail("EVENT_PAYLOAD 为空")
@@ -1227,7 +1455,7 @@ def main():
     mode = payload.get("mode", "singer")
     if not query:
         fail("缺少 query")
-    log(f"开始任务：mode={mode}, query={query}")
+    log(f"开始任务：mode={mode}, query={query}, allow_non_flac={ALLOW_NON_FLAC}, exclude_dj={EXCLUDE_DJ}")
     songs = discover_songs(mode, query)
     log(f"目录检索完成：共 {len(songs)} 首，歌曲名-歌手名支持同曲 Live、现场、伴奏、Remix 等明确版本，五人及以上合唱已过滤")
     if not songs:
@@ -1263,8 +1491,6 @@ def main():
             log(f"[{index}/{len(songs)}] 失败：三个音源都没有找到可用音频")
             failed.append(label)
             failed_details.append({
-                "title": original.get("title", ""),
-                "artist": original.get("artist", ""),
                 "stage": "source_resolution",
                 "source": "QQ aa.cab/QQ tang.api.s01s.cn/网易云音乐/酷我音乐",
                 "error": "三个音源都没有找到可用音频下载地址",
@@ -1292,7 +1518,7 @@ def main():
             openlist_cache[target_folder] = openlist_listing(auth, subfolder=target_folder)
         log(f"[{index}/{len(songs)}] 目标文件夹：{target_folder}")
         extension = str(found.get("extension") or Path(str(found.get("filename") or "")).suffix.lstrip(".") or "flac").lower()
-        base_filename = safe_filename(f"{filename_title} {original['artist']}", extension)
+        base_filename = safe_filename(f"{filename_title} {found.get('artist') or original['artist']}", extension)
         final_local = work / base_filename
         local = final_local.with_name(final_local.name + ".tmp")
         stage = "download"
@@ -1314,7 +1540,7 @@ def main():
                     found = next_found
                     filename_title = safe_name(str(found.get("filename_title") or original["title"]).strip())
                     extension = str(found.get("extension") or Path(str(found.get("filename") or "")).suffix.lstrip(".") or "flac").lower()
-                    base_filename = safe_filename(f"{filename_title} {original['artist']}", extension)
+                    base_filename = safe_filename(f"{filename_title} {found.get('artist') or original['artist']}", extension)
                     final_local = work / base_filename
                     local = final_local.with_name(final_local.name + ".tmp")
                     log(f"[{index}/{len(songs)}] 切换音源：{found['source']}")
@@ -1356,8 +1582,6 @@ def main():
             final_local.unlink(missing_ok=True)
             failed.append(label)
             failed_details.append({
-                "title": original.get("title", ""),
-                "artist": original.get("artist", ""),
                 "stage": stage,
                 "source": found.get("source", "unknown"),
                 "error": str(exc),
