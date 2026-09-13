@@ -1513,7 +1513,16 @@ def main():
         )
         artist_folder = ""
         if not single_title_search:
-            artist_folder = safe_name(artist_folder_name(found["artist"], original.get("artist")))
+            folder_artist_hint = original.get("artist") or found.get("artist")
+            if mode == "singer":
+                folder_artist_hint = query
+            elif mode == "search":
+                # 歌名-艺人搜索按用户请求的艺人建目录，不使用平台返回的合作艺人字符串。
+                for query_part in query_terms(query):
+                    if artists_match(query_part, found.get("artist", "")):
+                        folder_artist_hint = query_part
+                        break
+            artist_folder = safe_name(artist_folder_name(found["artist"], folder_artist_hint))
         folder_label = query if single_title_search else (original.get("title") or filename_title)
         target_folder = safe_name(normalize_folder_label(folder_label)) if single_title_search else artist_folder
         ensure_openlist_folder(auth, target_folder)
